@@ -812,6 +812,15 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 			dest[i] = nil
 			continue
 		}
+
+		if rows.raw {
+			// Wire-format pass-through: no parse/format round trip and no
+			// lossy conversions (zero dates, float formatting) for callers
+			// that forward values verbatim.
+			dest[i] = buf
+			continue
+		}
+
 		switch rows.rs.columns[i].fieldType {
 		case fieldTypeTimestamp,
 			fieldTypeDateTime,
