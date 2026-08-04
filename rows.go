@@ -25,6 +25,11 @@ type mysqlRows struct {
 	mc     *mysqlConn
 	rs     resultSet
 	finish func()
+	// raw delivers every non-NULL cell as its MySQL wire text ([]byte,
+	// aliasing the connection buffer) instead of parsing numeric and
+	// temporal columns into Go types. Set only on rows produced by
+	// QueryResultContext, which never pass through database/sql conversion.
+	raw bool
 }
 
 type binaryRows struct {
@@ -94,6 +99,12 @@ func (rows *mysqlRows) ColumnTypePrecisionScale(i int) (int64, int64, bool) {
 }
 
 func (rows *mysqlRows) ColumnTypeScanType(i int) reflect.Type {
+	if rows.raw {
+		// Next delivers wire text for every non-NULL cell regardless of the
+		// column's MySQL type, so report what it actually yields. The other
+		// ColumnType methods describe the column itself and stay accurate.
+		return scanTypeBytes
+	}
 	return rows.rs.columns[i].scanType()
 }
 
