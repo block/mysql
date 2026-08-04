@@ -36,7 +36,8 @@ import (
 //		...
 //	})
 //
-// Because Raw bypasses database/sql's argument conversion, args are
+// Named parameters are rejected, as they are by QueryContext and ExecContext.
+// Because Raw also bypasses database/sql's argument conversion, args are
 // normalized here with CheckNamedValue, exactly as database/sql would do
 // before QueryContext. As with QueryContext, non-empty args require
 // InterpolateParams; otherwise driver.ErrSkip is returned before anything is
@@ -54,9 +55,17 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 		return nil, nil, driver.ErrBadConn
 	}
 
-	dargs := make([]driver.Value, len(args))
-	for i := range args {
-		nv := args[i]
+	// Reject named parameters exactly as QueryContext and ExecContext do.
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Raw bypasses database/sql's argument conversion, which on the normal
+	// path runs CheckNamedValue before the driver sees the args. Apply it
+	// here so interpolateParams gets the same values either way.
+	for i := range dargs {
+		nv := driver.NamedValue{Ordinal: i + 1, Value: dargs[i]}
 		if err := mc.CheckNamedValue(&nv); err != nil {
 			return nil, nil, err
 		}

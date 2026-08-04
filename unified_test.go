@@ -14,6 +14,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +24,7 @@ import (
 // the OK-response counters.
 type unifiedResponse struct {
 	columns      []string
+	scanTypes    []reflect.Type
 	rows         [][][]byte // nil cell = NULL
 	isResultset  bool
 	rowsAffected int64
@@ -53,6 +56,12 @@ func unifiedExec(ctx context.Context, dbt *DBTest, query string, args []driver.N
 		defer rows.Close()
 		resp.isResultset = true
 		resp.columns = rows.Columns()
+		if st, ok := rows.(driver.RowsColumnTypeScanType); ok {
+			resp.scanTypes = make([]reflect.Type, len(resp.columns))
+			for i := range resp.scanTypes {
+				resp.scanTypes[i] = st.ColumnTypeScanType(i)
+			}
+		}
 		dest := make([]driver.Value, len(resp.columns))
 		for {
 			if err := rows.Next(dest); err != nil {
@@ -116,6 +125,15 @@ func TestQueryResultContext(t *testing.T) {
 			dbt.Errorf("NULL cell: %q", resp.rows[1][1])
 		}
 
+		// ColumnTypeScanType must describe what Next actually delivers on
+		// this path — []byte for every column, whatever its MySQL type —
+		// rather than the Go type the parsing path would have produced.
+		for i, st := range resp.scanTypes {
+			if st != scanTypeBytes {
+				dbt.Errorf("scan type for column %q: %v, want []uint8", resp.columns[i], st)
+			}
+		}
+
 		// Empty resultset is still a resultset, not an OK response.
 		resp, err = unifiedExec(ctx, dbt, "SELECT id FROM "+tbl+" WHERE 1 = 0", nil)
 		if err != nil {
@@ -150,6 +168,17 @@ func TestQueryResultContext(t *testing.T) {
 			}
 		} else if len(resp.rows) != 1 || string(resp.rows[0][0]) != "a" {
 			dbt.Fatalf("args SELECT rows: %v", resp.rows)
+		}
+
+		// Named parameters are unsupported, exactly as on QueryContext. This
+		// is checked before the InterpolateParams gate, so the outcome is the
+		// same under both DSN variants and must not be a silent positional
+		// bind.
+		named := []driver.NamedValue{{Name: "id", Ordinal: 1, Value: int64(1)}}
+		if _, err = unifiedExec(ctx, dbt, "SELECT note FROM "+tbl+" WHERE id = ?", named); err == nil {
+			dbt.Fatal("named parameter accepted")
+		} else if !strings.Contains(err.Error(), "Named Parameters") {
+			dbt.Fatalf("named parameter error: %s", err)
 		}
 
 		// Errors surface normally and leave the connection reusable.
