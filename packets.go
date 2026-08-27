@@ -687,13 +687,11 @@ func (mc *okHandler) conn() *mysqlConn {
 	return (*mysqlConn)(mc)
 }
 
-// clearResult clears the connection's stored affectedRows, insertIds and
-// warning count.
+// clearResult clears the connection's stored affectedRows and insertIds.
 //
 // It returns a handler that can process OK responses.
 func (mc *mysqlConn) clearResult() *okHandler {
 	mc.result = mysqlResult{}
-	mc.warnings = 0
 	return (*okHandler)(mc)
 }
 

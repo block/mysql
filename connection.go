@@ -36,7 +36,7 @@ type mysqlConn struct {
 	capabilities     capabilityFlag
 	extCapabilities  extendedCapabilityFlag
 	status           statusFlag
-	warnings         uint16 // managed by clearResult() and the OK/EOF readers; see Warnings().
+	warnings         uint16 // managed by resetSequence() and the OK/EOF readers; see Warnings().
 	sequence         uint8
 	compressSequence uint8
 	parseTime        bool
@@ -89,6 +89,12 @@ func (mc *mysqlConn) writeWithTimeout(b []byte) (int, error) {
 func (mc *mysqlConn) resetSequence() {
 	mc.sequence = 0
 	mc.compressSequence = 0
+	// Sending a command is also what ends the previous command's diagnostics,
+	// so this is where the warning count resets. Deliberately not clearResult():
+	// that also runs from (*mysqlRows).Close, which happens after the packet
+	// carrying the count has been read and would throw the count away before
+	// the caller could ask for it.
+	mc.warnings = 0
 }
 
 // syncSequence must be called when finished writing some packet and before start reading.

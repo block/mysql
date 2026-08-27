@@ -48,11 +48,24 @@ func TestHandleOkPacketWarnings(t *testing.T) {
 		t.Errorf("status: got %#04x, want 0x0002", got)
 	}
 
-	// The next statement starts by clearing the previous one's count, so a
+	// Sending the next command clears the previous statement's count, so a
 	// statement that warns cannot make a later quiet statement look noisy.
-	mc.clearResult()
+	mc.resetSequence()
 	if got := mc.Warnings(); got != 0 {
-		t.Errorf("Warnings after clearResult: got %d, want 0", got)
+		t.Errorf("Warnings after resetSequence: got %d, want 0", got)
+	}
+}
+
+// TestClearResultKeepsWarnings pins where the reset does *not* happen.
+// (*mysqlRows).Close calls clearResult after the packet carrying the count has
+// already been read, so clearing there would leave every resultset reporting
+// zero to a caller who read the count the only way it can be read: after Close.
+func TestClearResultKeepsWarnings(t *testing.T) {
+	mc := new(mysqlConn)
+	mc.readResultsetTerminator([]byte{iEOF, 0x04, 0x00, 0x02, 0x00})
+	mc.clearResult()
+	if got := mc.Warnings(); got != 4 {
+		t.Errorf("Warnings after clearResult: got %d, want 4", got)
 	}
 }
 
@@ -99,7 +112,13 @@ func TestReadResultsetTerminatorWarnings(t *testing.T) {
 // count left behind by the last of them, reading it the way an external caller
 // must: through Raw, after the response is complete. The error from the last
 // query is returned rather than fatal, so a failing statement can be probed.
-func execWarnings(ctx context.Context, dbt *DBTest, queries ...string) (uint16, error) {
+//
+// finish is how each resultset is disposed of before the count is read. That is
+// a real variable in callers — draining to EOF and closing an undrained
+// resultset take different paths through the driver — so it is a parameter.
+func execWarnings(
+	ctx context.Context, dbt *DBTest, finish func(driver.Rows) error, queries ...string,
+) (uint16, error) {
 	dbt.Helper()
 	conn, err := dbt.db.Conn(ctx)
 	if err != nil {
@@ -121,8 +140,8 @@ func execWarnings(ctx context.Context, dbt *DBTest, queries ...string) (uint16, 
 			}
 			if rows != nil {
 				// The terminating packet that carries the count has not been
-				// read until the rows are drained.
-				if err := drainRows(rows); err != nil {
+				// read until the resultset is finished.
+				if err := finish(rows); err != nil {
 					return err
 				}
 			}
@@ -135,10 +154,21 @@ func execWarnings(ctx context.Context, dbt *DBTest, queries ...string) (uint16, 
 	return warnings, queryErr
 }
 
-// connWarnings is execWarnings for a single query expected to succeed.
+// connWarnings is execWarnings for a single drained query expected to succeed.
 func connWarnings(ctx context.Context, dbt *DBTest, query string) uint16 {
 	dbt.Helper()
-	warnings, err := execWarnings(ctx, dbt, query)
+	warnings, err := execWarnings(ctx, dbt, drainRows, query)
+	if err != nil {
+		dbt.Fatalf("%s: %s", query, err)
+	}
+	return warnings
+}
+
+// connWarningsUndrained is connWarnings for a caller that closes the resultset
+// without reading it, which is what a proxy forwarding rows elsewhere does.
+func connWarningsUndrained(ctx context.Context, dbt *DBTest, query string) uint16 {
+	dbt.Helper()
+	warnings, err := execWarnings(ctx, dbt, driver.Rows.Close, query)
 	if err != nil {
 		dbt.Fatalf("%s: %s", query, err)
 	}
@@ -183,10 +213,18 @@ func TestWarnings(t *testing.T) {
 			dbt.Errorf("clean SELECT: got %d warnings, want 0", got)
 		}
 
+		// Closing a resultset without draining it goes through skipRows and the
+		// stored-result housekeeping that follows it, all of which runs after
+		// the terminating packet has been read. The count has to survive that.
+		if got := connWarningsUndrained(ctx, dbt, "SELECT CAST('abc' AS SIGNED)"); got != 1 {
+			dbt.Errorf("truncating CAST, undrained: got %d warnings, want 1", got)
+		}
+
 		// A failed statement reports zero even when the statement before it
 		// warned: an error packet carries no count of its own, and the failing
 		// statement's own start already cleared the previous one's.
-		got, err := execWarnings(ctx, dbt, "SELECT CAST('abc' AS SIGNED)", "SELECT * FROM "+tbl+"_absent")
+		got, err := execWarnings(ctx, dbt, drainRows,
+			"SELECT CAST('abc' AS SIGNED)", "SELECT * FROM "+tbl+"_absent")
 		if err == nil {
 			dbt.Fatal("expected the second statement to fail")
 		}
