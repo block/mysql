@@ -36,6 +36,7 @@ type mysqlConn struct {
 	capabilities     capabilityFlag
 	extCapabilities  extendedCapabilityFlag
 	status           statusFlag
+	warnings         uint16 // managed by clearResult() and the OK/EOF readers; see Warnings().
 	sequence         uint8
 	compressSequence uint8
 	parseTime        bool
