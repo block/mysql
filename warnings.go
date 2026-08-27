@@ -21,11 +21,14 @@ package mysql
 // Connector/J among them — use it exactly that way.
 //
 // It is valid from the moment the statement's response is complete until the
-// next statement starts on this connection, which resets it. For a resultset
-// that means after the rows have been fully read (or Close called): the
-// terminating packet carrying the count has not arrived before then. A
-// statement that fails with an error packet leaves the previous count in
-// place, since an error packet carries no count of its own.
+// next statement starts on this connection, which resets it to zero. For a
+// resultset that means after the rows have been fully read (or Close called):
+// the terminating packet carrying the count has not arrived before then.
+//
+// An error packet carries no count of its own, so a statement that fails
+// reports zero — the value the statement's own start left behind. Inside a
+// multi-statement, where each statement gets its own OK packet, a failure
+// instead leaves the last successful statement's count in place.
 //
 // Reach it through (*sql.Conn).Raw and an interface assertion:
 //

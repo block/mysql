@@ -725,9 +725,9 @@ func (mc *okHandler) handleOkPacket(data []byte) error {
 
 	// warning count [2 bytes]
 	//
-	// Recorded before the more-results check so that each statement of a
-	// multi-statement leaves its own count behind: the caller reads it after
-	// the statement it belongs to, not after the whole batch.
+	// Recorded unconditionally, including when statusMoreResultsExists is set:
+	// every statement of a multi-statement gets an OK packet of its own, and
+	// each should leave its own count behind rather than only the last.
 	mc.warnings = readWarnings(data[1+n+m+2:])
 
 	return nil

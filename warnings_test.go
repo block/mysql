@@ -95,10 +95,11 @@ func TestReadResultsetTerminatorWarnings(t *testing.T) {
 	}
 }
 
-// connWarnings runs query on its own connection and reports the warning count
-// the server sent with the response, reading it the way an external caller
-// must: through Raw, after the response is complete.
-func connWarnings(ctx context.Context, dbt *DBTest, query string) uint16 {
+// execWarnings runs queries in order on one connection and reports the warning
+// count left behind by the last of them, reading it the way an external caller
+// must: through Raw, after the response is complete. The error from the last
+// query is returned rather than fatal, so a failing statement can be probed.
+func execWarnings(ctx context.Context, dbt *DBTest, queries ...string) (uint16, error) {
 	dbt.Helper()
 	conn, err := dbt.db.Conn(ctx)
 	if err != nil {
@@ -106,23 +107,39 @@ func connWarnings(ctx context.Context, dbt *DBTest, query string) uint16 {
 	}
 	defer conn.Close()
 
-	var warnings uint16
+	var (
+		warnings uint16
+		queryErr error
+	)
 	if err := conn.Raw(func(dc any) error {
 		mc := dc.(*mysqlConn)
-		rows, _, err := mc.QueryResultContext(ctx, query, nil)
-		if err != nil {
-			return err
-		}
-		if rows != nil {
-			// The terminating packet that carries the count has not been
-			// read until the rows are drained.
-			if err := drainRows(rows); err != nil {
-				return err
+		for _, query := range queries {
+			rows, _, err := mc.QueryResultContext(ctx, query, nil)
+			if err != nil {
+				queryErr = err
+				break
+			}
+			if rows != nil {
+				// The terminating packet that carries the count has not been
+				// read until the rows are drained.
+				if err := drainRows(rows); err != nil {
+					return err
+				}
 			}
 		}
 		warnings = mc.Warnings()
 		return nil
 	}); err != nil {
+		dbt.Fatalf("%v: %s", queries, err)
+	}
+	return warnings, queryErr
+}
+
+// connWarnings is execWarnings for a single query expected to succeed.
+func connWarnings(ctx context.Context, dbt *DBTest, query string) uint16 {
+	dbt.Helper()
+	warnings, err := execWarnings(ctx, dbt, query)
+	if err != nil {
 		dbt.Fatalf("%s: %s", query, err)
 	}
 	return warnings
@@ -164,6 +181,17 @@ func TestWarnings(t *testing.T) {
 		}
 		if got := connWarnings(ctx, dbt, "SELECT * FROM "+tbl); got != 0 {
 			dbt.Errorf("clean SELECT: got %d warnings, want 0", got)
+		}
+
+		// A failed statement reports zero even when the statement before it
+		// warned: an error packet carries no count of its own, and the failing
+		// statement's own start already cleared the previous one's.
+		got, err := execWarnings(ctx, dbt, "SELECT CAST('abc' AS SIGNED)", "SELECT * FROM "+tbl+"_absent")
+		if err == nil {
+			dbt.Fatal("expected the second statement to fail")
+		}
+		if got != 0 {
+			dbt.Errorf("after a failed statement: got %d warnings, want 0", got)
 		}
 	})
 }
