@@ -37,30 +37,9 @@ func (rows *mysqlRows) readRowPacket(binary bool) ([]byte, error) {
 		return nil, ErrMalformPkt
 	}
 	if data[0] == iEOF && (binary || len(data) <= 0xffffff) {
-		statusPos := 3
-		if mc.capabilities&clientDeprecateEOF != 0 {
-			// Skip affected_rows and last_insert_id, both length-encoded integers.
-			statusPos = 1
-			for range 2 {
-				if statusPos >= len(data) {
-					return nil, ErrMalformPkt
-				}
-				n := 1
-				switch data[statusPos] {
-				case 0xfc:
-					n = 3
-				case 0xfd:
-					n = 4
-				case 0xfe:
-					n = 9
-				}
-				statusPos += n
-			}
+		if err := mc.readResultsetTerminator(data); err != nil {
+			return nil, err
 		}
-		if len(data) < statusPos+2 {
-			return nil, ErrMalformPkt
-		}
-		mc.status = readStatus(data[statusPos:])
 		rows.rs.done = true
 		if !rows.HasNextResultSet() {
 			rows.mc = nil
