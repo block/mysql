@@ -632,6 +632,37 @@ func readStatus(b []byte) statusFlag {
 	return statusFlag(b[0]) | statusFlag(b[1])<<8
 }
 
+// readResultsetTerminator records the status flags and warning count carried by
+// the packet that ends a resultset: a classic EOF packet, or an OK packet sent
+// with an 0xFE header once CLIENT_DEPRECATE_EOF is negotiated. The two layouts
+// order those two fields differently, which is why reading them lives in one
+// place. data is the whole packet, starting at the 0xFE header.
+func (mc *mysqlConn) readResultsetTerminator(data []byte) {
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		// Deprecated EOF packet: header, warning count, status flags.
+		// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
+		mc.warnings = readWarnings(data[1:])
+		mc.status = readStatus(data[3:])
+		return
+	}
+	// OK packet with an 0xFE header: status flags precede the warning count.
+	_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
+	_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
+	mc.status = readStatus(data[1+n+m:])
+	mc.warnings = readWarnings(data[1+n+m+2:])
+}
+
+// readWarnings reads the two-byte warning count that OK and EOF packets carry
+// under CLIENT_PROTOCOL_41. The driver always negotiates that capability, so a
+// buffer too short to hold the field means a malformed packet rather than an
+// older server; report no warnings rather than panicking on a slice bound.
+func readWarnings(b []byte) uint16 {
+	if len(b) < 2 {
+		return 0
+	}
+	return uint16(b[0]) | uint16(b[1])<<8
+}
+
 // Returns an instance of okHandler for codepaths where mysqlConn.result doesn't
 // need to be cleared first (e.g. during authentication, or while additional
 // resultsets are being fetched.)
@@ -656,8 +687,7 @@ func (mc *okHandler) conn() *mysqlConn {
 	return (*mysqlConn)(mc)
 }
 
-// clearResult clears the connection's stored affectedRows and insertIds
-// fields.
+// clearResult clears the connection's stored affectedRows and insertIds.
 //
 // It returns a handler that can process OK responses.
 func (mc *mysqlConn) clearResult() *okHandler {
@@ -690,11 +720,13 @@ func (mc *okHandler) handleOkPacket(data []byte) error {
 
 	// server_status [2 bytes]
 	mc.status = readStatus(data[1+n+m : 1+n+m+2])
-	if mc.status&statusMoreResultsExists != 0 {
-		return nil
-	}
 
 	// warning count [2 bytes]
+	//
+	// Recorded unconditionally, including when statusMoreResultsExists is set:
+	// every statement of a multi-statement gets an OK packet of its own, and
+	// each should leave its own count behind rather than only the last.
+	mc.warnings = readWarnings(data[1+n+m+2:])
 
 	return nil
 }
@@ -823,16 +855,7 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 	// In such case, 0xFE can mean string larger than 0xffffff.
 	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_dt_integers.html#sect_protocol_basic_dt_int_le
 	if data[0] == iEOF && len(data) <= 0xffffff {
-		if mc.capabilities&clientDeprecateEOF == 0 {
-			// Deprecated EOF packet
-			// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
-			mc.status = readStatus(data[3:])
-		} else {
-			// Ok Packet with an 0xFE header
-			_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-			_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
-			mc.status = readStatus(data[1+n+m:])
-		}
+		mc.readResultsetTerminator(data)
 		rows.rs.done = true
 		if !rows.HasNextResultSet() {
 			rows.mc = nil
@@ -955,15 +978,7 @@ func (mc *mysqlConn) skipRows() error {
 			// text row packets may starts with LengthEncodedString.
 			// In such case, 0xFE can mean string larger than 0xffffff.
 			if len(data) <= 0xffffff {
-				if mc.capabilities&clientDeprecateEOF == 0 {
-					// EOF packet
-					mc.status = readStatus(data[3:])
-				} else {
-					// OK packet with an 0xFE header
-					_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-					_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
-					mc.status = readStatus(data[1+n+m:])
-				}
+				mc.readResultsetTerminator(data)
 				return nil
 			}
 		}
@@ -1281,15 +1296,7 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 	if data[0] != iOK {
 		// EOF/OK Packet
 		if data[0] == iEOF {
-			if rows.mc.capabilities&clientDeprecateEOF == 0 {
-				// EOF packet
-				rows.mc.status = readStatus(data[3:])
-			} else {
-				// OK Packet with an 0xFE header
-				_, _, n := readLengthEncodedInteger(data[1:])
-				_, _, m := readLengthEncodedInteger(data[1+n:])
-				rows.mc.status = readStatus(data[1+n+m:])
-			}
+			rows.mc.readResultsetTerminator(data)
 			rows.rs.done = true
 			if !rows.HasNextResultSet() {
 				rows.mc = nil
