@@ -60,7 +60,7 @@ func (rows *mysqlRows) readRowPacket(binary bool) ([]byte, error) {
 		if len(data) < statusPos+2 {
 			return nil, ErrMalformPkt
 		}
-		mc.status = readStatus(data[statusPos:])
+		mc.readResultsetTerminator(data)
 		rows.rs.done = true
 		if !rows.HasNextResultSet() {
 			rows.mc = nil
