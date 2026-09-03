@@ -421,8 +421,8 @@ func TestNumbersToAny(t *testing.T) {
 		if err != nil {
 			dbt.Fatal(err)
 		}
-		if b.(int64) != 1 {
-			dbt.Errorf("b != 1")
+		if b != true {
+			dbt.Errorf("b = %#v; want true", b)
 		}
 		if i8.(int64) != 127 {
 			dbt.Errorf("i8 != 127")
@@ -3053,6 +3053,9 @@ func TestRowsColumnTypes(t *testing.T) {
 	ni0 := sql.NullInt64{Int64: 0, Valid: true}
 	ni1 := sql.NullInt64{Int64: 1, Valid: true}
 	ni42 := sql.NullInt64{Int64: 42, Valid: true}
+	nbNULL := sql.NullBool{Bool: false, Valid: false}
+	nb0 := sql.NullBool{Bool: false, Valid: true}
+	nb1 := sql.NullBool{Bool: true, Valid: true}
 	nfNULL := sql.NullFloat64{Float64: 0.0, Valid: false}
 	nf0 := sql.NullFloat64{Float64: 0.0, Valid: true}
 	nf1337 := sql.NullFloat64{Float64: 13.37, Valid: true}
@@ -3088,8 +3091,8 @@ func TestRowsColumnTypes(t *testing.T) {
 		valuesOut        [3]any
 	}{
 		{"bit8null", "BIT(8)", "BIT", scanTypeBytes, true, 0, 0, [3]string{"0x0", "NULL", "0x42"}, [3]any{bx0, bNULL, bx42}},
-		{"boolnull", "BOOL", "TINYINT", scanTypeNullInt, true, 0, 0, [3]string{"NULL", "true", "0"}, [3]any{niNULL, ni1, ni0}},
-		{"bool", "BOOL NOT NULL", "TINYINT", scanTypeInt8, false, 0, 0, [3]string{"1", "0", "FALSE"}, [3]any{int8(1), int8(0), int8(0)}},
+		{"boolnull", "BOOL", "BOOLEAN", reflect.TypeFor[sql.NullBool](), true, 0, 0, [3]string{"NULL", "true", "0"}, [3]any{nbNULL, nb1, nb0}},
+		{"bool", "BOOL NOT NULL", "BOOLEAN", reflect.TypeFor[bool](), false, 0, 0, [3]string{"1", "0", "FALSE"}, [3]any{true, false, false}},
 		{"intnull", "INTEGER", "INT", scanTypeNullInt, true, 0, 0, [3]string{"0", "NULL", "42"}, [3]any{ni0, niNULL, ni42}},
 		{"smallint", "SMALLINT NOT NULL", "SMALLINT", scanTypeInt16, false, 0, 0, [3]string{"0", "-32768", "32767"}, [3]any{int16(0), int16(-32768), int16(32767)}},
 		{"smallintnull", "SMALLINT", "SMALLINT", scanTypeNullInt, true, 0, 0, [3]string{"0", "NULL", "42"}, [3]any{ni0, niNULL, ni42}},

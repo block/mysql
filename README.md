@@ -45,8 +45,8 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
 
 ## Requirements
 
-* Go 1.24 or higher. We aim to support the 3 latest versions of Go.
-* MySQL (5.7+) and MariaDB (10.5+) are supported by maintainers.
+* Go 1.25 or higher. We aim to support the 3 latest versions of Go.
+* MySQL (8.0+) and MariaDB (10.11+) are supported by maintainers.
 * [TiDB](https://github.com/pingcap/tidb) is supported by PingCAP.
   * Do not ask questions about TiDB in our issue tracker or forum.
   * [Document](https://docs.pingcap.com/tidb/v6.1/dev-guide-sample-application-golang)
@@ -314,7 +314,22 @@ Type:           duration
 Default:        0
 ```
 
-[Truncate time values](https://pkg.go.dev/time#Duration.Truncate) to the specified duration. The value must be a decimal number with a unit suffix (*"ms"*, *"s"*, *"m"*, *"h"*), such as *"30s"*, *"0.5m"* or *"1m30s"*.
+[Truncate time values](https://pkg.go.dev/time#Duration.Truncate) in query arguments to the specified duration. The value must be a decimal number with a unit suffix (*"ns"*, *"us"*, *"ms"*, etc...), such as "1us", "1ms", or "10ns".
+
+> [!NOTE]
+> `time.Time` arguments are sent with up to nanosecond precision, so a value from `time.Now()` usually has more fractional-second digits than a `DATETIME(N)` or `TIMESTAMP(N)` column stores. On MariaDB, comparing such a value against an indexed column can prevent an index range scan, turning it into a full index scan. Truncating to the column's precision (`1us` for `DATETIME(6)`) avoids this. Only arguments sent to the server are truncated; values read from the server are not affected.
+
+##### `tinyInt1IsBool`
+
+```
+Type:           bool
+Valid Values:   true, false
+Default:        true
+```
+
+When `tinyInt1IsBool=true`, signed `TINYINT(1)` columns are treated as boolean values. Zero is returned as `false`, and non-zero values are returned as `true`. Their database type name is reported as `BOOLEAN`, and their scan type is `bool` for non-nullable columns or `sql.NullBool` for nullable columns.
+
+Unsigned and `ZEROFILL` columns are not converted. Set `tinyInt1IsBool=false` to preserve the numeric `TINYINT` behavior.
 
 ##### `maxAllowedPacket`
 ```
