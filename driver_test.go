@@ -2293,26 +2293,29 @@ func TestColumnsReusesSlice(t *testing.T) {
 	}
 }
 
+// TestRejectReadOnly exercises the read-only rejection, which this fork
+// applies unconditionally. Upstream's version of this test also asserted the
+// behaviour with the option off; that is no longer a state the driver can be
+// in, so the first case now covers a DSN that says nothing.
 func TestRejectReadOnly(t *testing.T) {
+	// No parameter: the rejection happens anyway. This is the case upstream's
+	// default gets wrong.
 	runTests(t, dsn, func(dbt *DBTest) {
 		// Create Table
 		dbt.mustExec("CREATE TABLE test (value BOOL)")
-		// Set the session to read-only. We didn't set the `rejectReadOnly`
-		// option, so any writes after this should fail.
+		// Set the session to read only. Any writes after this should error on
+		// a driver.ErrBadConn, and cause `database/sql` to initiate a new
+		// connection.
 		_, err := dbt.db.Exec("SET SESSION TRANSACTION READ ONLY")
 		// Error 1193: Unknown system variable 'TRANSACTION' => skip test,
 		// MySQL server version is too old
 		maybeSkip(t, err, 1193)
-		if _, err := dbt.db.Exec("DROP TABLE test"); err == nil {
-			t.Fatalf("writing to DB in read-only session without " +
-				"rejectReadOnly did not error")
-		}
-		// Set the session back to read-write so runTests() can properly clean
-		// up the table `test`.
-		dbt.mustExec("SET SESSION TRANSACTION READ WRITE")
+		// This would error, but `database/sql` should automatically retry on a
+		// new connection which is not read-only, and eventually succeed.
+		dbt.mustExec("DROP TABLE test")
 	})
 
-	// Enable the `rejectReadOnly` option.
+	// rejectReadOnly=true still parses, for a DSN written against upstream.
 	runTests(t, dsn+"&rejectReadOnly=true", func(dbt *DBTest) {
 		// Create Table
 		dbt.mustExec("CREATE TABLE test (value BOOL)")

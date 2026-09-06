@@ -45,7 +45,8 @@ partition's own bundle to verify them.
 
 ## What this fork changes
 
-Two things, both for packaging reasons only. Neither alters protocol behaviour.
+Three things. The first two are packaging; neither alters protocol
+behaviour. The third changes a default, deliberately.
 
 **The module path is `github.com/block/mysql`.** Upstream's path plus a
 `replace` directive would work for a binary, but `replace` is not inherited
@@ -65,6 +66,14 @@ connections with:
 ```go
 db, err := sql.Open("block-mysql", dsn)
 ```
+
+**Read-only connections are always rejected.** Upstream's `rejectReadOnly`
+option defaults to off; here the behaviour is unconditional and
+`Config.RejectReadOnly` is gone. RDS and Aurora fail over by moving DNS, so a
+pooled connection to the demoted writer stays open and every write on it fails
+until the process restarts — with nothing in the DSN or the error to say the
+connection is the problem. See the `rejectReadOnly` parameter below for what
+happens to a DSN that still sets it.
 
 The DSN format, `Config`, and the rest of the API are upstream's.
 
@@ -97,11 +106,15 @@ git fetch upstream
 git merge upstream/master
 ```
 
-Edits to upstream files are confined to three things: the module path and
+Edits to upstream files are confined to four things: the module path and
 driver name (`go.mod`, `driver.go`, plus doc comments and test call sites that
-spell either one out), the CI matrix (see below), and a one-line call in
-`Config.normalize` that hands off to `rds.go`. The capabilities above live in
-files upstream does not have, which is what keeps merges near-mechanical.
+spell either one out), the CI matrix (see below), a one-line call in
+`Config.normalize` that hands off to `rds.go`, and the read-only rejection (one
+condition in `packets.go`, the parameter in `dsn.go`, and the
+read-only-transaction flag in `connection.go`/`transaction.go`). The
+capabilities above live in files upstream does not have, which is what keeps
+merges near-mechanical.
+
 Additions are cheapest when they follow the same shape: new files, or new
 methods on existing types, in preference to reworking an upstream code path.
 
@@ -522,30 +535,56 @@ I/O read timeout. The value must be a decimal number with a unit suffix (*"ms"*,
 
 ```
 Type:           bool
-Valid Values:   true, false
-Default:        false
+Valid Values:   true
+Default:        (always on; see below)
 ```
 
+**Changed in this fork.** Upstream makes this an option, defaulting to off.
+Here the driver always rejects read-only connections, `Config.RejectReadOnly`
+is gone, and the parameter survives only so a DSN written for upstream keeps
+parsing: `rejectReadOnly=true` is accepted and does nothing, while
+`rejectReadOnly=false` is an error rather than a silent no-op, because it
+states an expectation the driver will not meet.
 
-`rejectReadOnly=true` causes the driver to reject read-only connections. This
-is for a possible race condition during an automatic failover, where the mysql
-client gets connected to a read-only replica after the failover.
+Rejecting means that when a statement fails with a read-only error (1792, 1290
+or 1836), the driver closes that connection and returns `driver.ErrBadConn`, so
+`database/sql` retries the statement on a new one.
 
-Note that this should be a fairly rare case, as an automatic failover normally
-happens when the primary is down, and the race condition shouldn't happen
-unless it comes back up online as soon as the failover is kicked off. On the
-other hand, when this happens, a MySQL application can get stuck on a
-read-only connection until restarted. It is however fairly easy to reproduce,
-for example, using a manual failover on AWS Aurora's MySQL-compatible cluster.
+It is not optional because the failure it prevents is silent and the mistake
+that causes it is invisible. RDS and Aurora fail over by moving DNS: a pooled
+connection to the demoted writer stays open and stays usable, and every write
+on it fails for as long as the pool keeps it — until the process restarts.
+Nothing in the DSN or in the error says the connection is the problem, and a
+deployment that forgot the option does not find out until a failover.
 
-If you are not relying on read-only transactions to reject writes that aren't
-supposed to happen, setting this on some MySQL providers (such as AWS Aurora)
-is safer for failovers.
+One exception: a transaction opened with `sql.TxOptions{ReadOnly: true}` is
+exempt. There the read-only error is the answer the caller asked for, and
+`database/sql` does not retry inside a transaction anyway, so rejecting would
+replace a usable `*MySQLError` with a dead transaction.
 
-Note that ERROR 1290 can be returned for a `read-only` server and this option will
-cause a retry for that error. However the same error number is used for some
-other cases. You should ensure your application will never cause an ERROR 1290
-except for `read-only` mode when enabling this option.
+Two consequences worth knowing:
+
+* A session made read-only by the application's own `SET SESSION TRANSACTION
+  READ ONLY` is *not* exempt — nothing distinguishes it from a demoted writer.
+  Writes on such a session are retried on a new connection instead of failing.
+  Use privileges, or the `ReadOnly` transaction option, to express that intent.
+* ERROR 1290 is also raised for conditions unrelated to failover — the ones you
+  are likely to meet are `secure_file_priv` (a `SELECT … INTO OUTFILE` or `LOAD
+  DATA` outside the permitted directory), `super_read_only`, `innodb_read_only`
+  and `--skip-grant-tables`. All of these persist rather than clear, so the
+  statement is retried, the connection churned, and the caller finally sees
+  `driver.ErrBadConn` rather than the message that named the problem. The
+  driver logs the server's own error before discarding it, so the condition is
+  still identifiable — look for `closing read-only connection` in the log.
+
+**If your target is deliberately read-only** — an Aurora reader endpoint, a
+replica, a source you only ever read from — this fork is a poor fit for that
+connection, and there is no longer an option to turn it off. Wrap reads in
+`sql.TxOptions{ReadOnly: true}` and they are exempt; anything on autocommit
+that the server rejects will still be retried and churned. If that is not
+workable, use a driver that lets you disable the behaviour for that connection.
+The trade is deliberate: the population this fork serves writes to RDS
+primaries, where the silent failure is the more expensive one.
 
 
 ##### `serverPubKey`

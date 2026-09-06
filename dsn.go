@@ -72,7 +72,6 @@ type Config struct {
 	InterpolateParams        bool // Interpolate placeholders into query string
 	MultiStatements          bool // Allow multiple statements in one query
 	ParseTime                bool // Parse time values to time.Time
-	RejectReadOnly           bool // Reject read-only connections
 
 	// unexported fields. new options should be come here.
 	// boolean first. alphabetical order.
@@ -407,10 +406,6 @@ func (cfg *Config) FormatDSN() string {
 		writeDSNParam(&buf, &hasParam, "readTimeout", cfg.ReadTimeout.String())
 	}
 
-	if cfg.RejectReadOnly {
-		writeDSNParam(&buf, &hasParam, "rejectReadOnly", "true")
-	}
-
 	if len(cfg.ServerPubKey) > 0 {
 		writeDSNParam(&buf, &hasParam, "serverPubKey", url.QueryEscape(cfg.ServerPubKey))
 	}
@@ -677,12 +672,22 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 				return
 			}
 
-		// Reject read-only connections
+		// Reject read-only connections.
+		//
+		// Fork change: this is unconditional here, so the parameter carries no
+		// information. It is still accepted, because a DSN written for upstream
+		// should not stop parsing — but only in the direction that agrees with
+		// what the driver does. rejectReadOnly=false is refused rather than
+		// ignored: it states an expectation the driver will not meet, and a
+		// silent no-op is exactly the kind of quiet disagreement this change
+		// exists to remove. See packets.go.
 		case "rejectReadOnly":
-			var isBool bool
-			cfg.RejectReadOnly, isBool = readBool(value)
+			on, isBool := readBool(value)
 			if !isBool {
 				return errors.New("invalid bool value: " + value)
+			}
+			if !on {
+				return errors.New("rejectReadOnly=false: this driver always rejects read-only connections; the option cannot be disabled")
 			}
 
 		// Server public key

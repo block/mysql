@@ -129,7 +129,9 @@ var testDSNs = []struct {
 			cfg.AllowOldPasswords = true
 			cfg.ClientFoundRows = true
 			cfg.ParseTime = true
-			cfg.RejectReadOnly = true
+			// rejectReadOnly=true is still in the DSN above: it parses and
+			// sets nothing, because this driver always rejects read-only
+			// connections. See dsn.go.
 		}),
 	},
 	{

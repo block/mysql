@@ -41,6 +41,13 @@ type mysqlConn struct {
 	parseTime        bool
 	compress         bool
 
+	// inReadOnlyTx is set while a transaction the caller explicitly opened
+	// with driver.TxOptions.ReadOnly is in flight. Fork addition: it is the
+	// one case where a read-only error is the answer the caller asked for
+	// rather than a sign of a demoted writer, so handleErrorPacket must not
+	// turn it into ErrBadConn. See packets.go.
+	inReadOnlyTx bool
+
 	// for context support (Go 1.8+)
 	watching bool
 	watcher  chan<- context.Context
@@ -165,6 +172,7 @@ func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
 	}
 	err := mc.exec(q)
 	if err == nil {
+		mc.inReadOnlyTx = readOnly
 		return &mysqlTx{mc}, err
 	}
 	return nil, mc.markBadConn(err)
@@ -794,6 +802,14 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 	if mc.closed.Load() || mc.buf.busy() {
 		return driver.ErrBadConn
 	}
+
+	// Fork addition: re-establish the read-only-transaction exemption for the
+	// new borrower. Commit and Rollback both clear it and every sql.Tx ends in
+	// one of them, so this is hardening rather than a fix — but the direction
+	// it can get stuck in, true, silently disables the read-only rejection for
+	// the rest of this connection's life, and a pooled connection's
+	// assumptions belong here. See packets.go.
+	mc.inReadOnlyTx = false
 
 	// Perform a stale connection check. We only perform this check for
 	// the first query on a connection that has been checked out of the

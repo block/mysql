@@ -24,6 +24,7 @@ func (tx *mysqlTx) Commit() (err error) {
 		return
 	}
 	err = tx.mc.exec("COMMIT")
+	tx.mc.inReadOnlyTx = false
 	tx.mc = nil
 	return
 }
@@ -40,6 +41,7 @@ func (tx *mysqlTx) Rollback() (err error) {
 		return
 	}
 	err = tx.mc.exec("ROLLBACK")
+	tx.mc.inReadOnlyTx = false
 	tx.mc = nil
 	return
 }
