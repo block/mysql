@@ -598,12 +598,29 @@ func (mc *mysqlConn) handleErrorPacket(data []byte) error {
 	// 1792: ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION
 	// 1290: ER_OPTION_PREVENTS_STATEMENT (returned by Aurora during failover)
 	// 1836: ER_READ_ONLY_MODE
-	if (errno == 1792 || errno == 1290 || errno == 1836) && mc.cfg.RejectReadOnly {
+	if (errno == 1792 || errno == 1290 || errno == 1836) && !mc.inReadOnlyTx {
 		// Oops; we are connected to a read-only connection, and won't be able
-		// to issue any write statements. Since RejectReadOnly is configured,
-		// we throw away this connection hoping this one would have write
-		// permission. This is specifically for a possible race condition
-		// during failover (e.g. on AWS Aurora). See README.md for more.
+		// to issue any write statements. We throw away this connection hoping
+		// the next one would have write permission. This is specifically for a
+		// possible race condition during failover (e.g. on AWS Aurora). See
+		// README.md for more.
+		//
+		// Fork change: upstream gates this on the rejectReadOnly option, which
+		// defaults to off. It is unconditional here. On a provider that fails
+		// over by moving DNS — RDS and Aurora both do — an application that
+		// leaves it off keeps a pooled connection to the demoted writer and
+		// every write on it fails, indefinitely, with no error that says the
+		// connection is the problem. Nothing about the DSN reveals the
+		// omission, so it is not a mistake a deployment discovers except
+		// during a failover. See dsn.go for what happens to the option.
+		//
+		// The one exception is a transaction the caller opened with
+		// driver.TxOptions.ReadOnly: there the read-only error is the answer
+		// they asked for, and database/sql does not retry inside a
+		// transaction anyway, so rejecting would replace a usable
+		// *MySQLError with a dead transaction. A session made read-only by
+		// the application's own SET is not exempt — nothing distinguishes it
+		// from a demoted writer.
 		//
 		// We explicitly close the connection before returning
 		// driver.ErrBadConn to ensure that `database/sql` purges this

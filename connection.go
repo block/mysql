@@ -41,6 +41,13 @@ type mysqlConn struct {
 	parseTime        bool
 	compress         bool
 
+	// inReadOnlyTx is set while a transaction the caller explicitly opened
+	// with driver.TxOptions.ReadOnly is in flight. Fork addition: it is the
+	// one case where a read-only error is the answer the caller asked for
+	// rather than a sign of a demoted writer, so handleErrorPacket must not
+	// turn it into ErrBadConn. See packets.go.
+	inReadOnlyTx bool
+
 	// for context support (Go 1.8+)
 	watching bool
 	watcher  chan<- context.Context
@@ -165,6 +172,7 @@ func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
 	}
 	err := mc.exec(q)
 	if err == nil {
+		mc.inReadOnlyTx = readOnly
 		return &mysqlTx{mc}, err
 	}
 	return nil, mc.markBadConn(err)
