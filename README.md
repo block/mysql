@@ -1,4 +1,85 @@
+# block/mysql
+
+**A tracking fork of [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql).**
+
+Upstream is merged forward regularly and the delta is kept deliberately small:
+this fork carries a short list of additive capabilities that upstream has not
+adopted, and nothing else. The upstream README follows below the separator,
+edited only where it names the import path or driver name.
+
+## What this fork adds
+
+| Capability | What it is | Upstream status |
+| --- | --- | --- |
+| [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns the response in the shape the server chose — exactly one of `driver.Rows` or `driver.Result`. Callers handling SQL they did not write (a proxy, a REPL) otherwise have to classify statements up front to pick between `QueryContext` and `ExecContext`, and a misclassification either discards a resultset or loses the OK-packet metadata. | Proposed as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793); no maintainer response. Merged here as [#1](https://github.com/block/mysql/pull/1). |
+| [`Warnings()`](warnings.go) | Exposes the warning count from the OK/EOF packet that terminated the last statement — the same number MySQL reports as `@@warning_count`. Warnings themselves live in per-connection state that only `SHOW WARNINGS` can read, so the count is what makes surfacing them affordable: it says whether that round trip would return anything. | Not proposed upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
+
+Both are reached through `(*sql.Conn).Raw` and a structural interface
+assertion, so a consumer can depend on the *capability* without a compile-time
+dependency on this module. See the doc comments in `unified.go` and
+`warnings.go` for the exact contracts.
+
+## What this fork changes
+
+Two things, both for packaging reasons only. Neither alters protocol behaviour.
+
+**The module path is `github.com/block/mysql`.** Upstream's path plus a
+`replace` directive would work for a binary, but `replace` is not inherited
+across module boundaries: a downstream module importing a *library* built on
+this fork gets upstream go-sql-driver instead, with no diagnostic. Depending on
+how the library reaches the fork's features that is either a compile failure or
+— worse, and the case that motivated this change — a clean build that fails at
+runtime. A distinct module path is the only mechanism Go has for expressing a
+dependency that is not substitutable.
+
+**The driver registers as `block-mysql`, not `mysql`.** This is required rather
+than cosmetic. Because the module path now differs, a dependency graph that
+still reaches upstream go-sql-driver anywhere links both packages into one
+binary, and two `sql.Register` calls under the same name panic at init. Open
+connections with:
+
+```go
+db, err := sql.Open("block-mysql", dsn)
+```
+
+The DSN format, `Config`, and the rest of the API are upstream's.
+
+## Linking both drivers
+
+Where a binary links this fork *and* upstream, remember that the two packages
+declare distinct types even though the source is identical. Most importantly,
+an `*mysql.MySQLError` produced by this package will not satisfy an
+`errors.As` against upstream's `*mysql.MySQLError`, and vice versa — the check
+silently returns false rather than failing loudly. Be deliberate about which
+package each error-inspection site imports, and prefer moving code you control
+onto one of the two.
+
+## Staying current
+
+```bash
+git remote add upstream https://github.com/go-sql-driver/mysql.git
+git fetch upstream
+git merge upstream/master
+```
+
+Edits to upstream files are confined to the module path and driver name
+(`go.mod`, `driver.go`, plus doc comments and test call sites that spell either
+one out); the capabilities above live in files upstream does not have. That
+keeps merges near-mechanical, and keeping it that way is a maintenance
+requirement rather than a preference: anything that changes upstream's connect,
+TLS, or packet paths belongs in a wrapper package, not here.
+
+## License
+
+MPL-2.0, unchanged from upstream, as are `LICENSE` and `AUTHORS`. Modified and
+added files stay under the MPL and are published here in satisfaction of it.
+Copyright in the original work remains with The Go-MySQL-Driver Authors.
+
+---------------------------------------
+
 # Go-MySQL-Driver
+
+*Upstream README follows.*
 
 [![DeepWiki](https://img.shields.io/badge/DeepWiki-go--sql--driver%2Fmysql-blue.svg?logo=data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACwAAAAyCAYAAAAnWDnqAAAAAXNSR0IArs4c6QAAA05JREFUaEPtmUtyEzEQhtWTQyQLHNak2AB7ZnyXZMEjXMGeK/AIi+QuHrMnbChYY7MIh8g01fJoopFb0uhhEqqcbWTp06/uv1saEDv4O3n3dV60RfP947Mm9/SQc0ICFQgzfc4CYZoTPAswgSJCCUJUnAAoRHOAUOcATwbmVLWdGoH//PB8mnKqScAhsD0kYP3j/Yt5LPQe2KvcXmGvRHcDnpxfL2zOYJ1mFwrryWTz0advv1Ut4CJgf5uhDuDj5eUcAUoahrdY/56ebRWeraTjMt/00Sh3UDtjgHtQNHwcRGOC98BJEAEymycmYcWwOprTgcB6VZ5JK5TAJ+fXGLBm3FDAmn6oPPjR4rKCAoJCal2eAiQp2x0vxTPB3ALO2CRkwmDy5WohzBDwSEFKRwPbknEggCPB/imwrycgxX2NzoMCHhPkDwqYMr9tRcP5qNrMZHkVnOjRMWwLCcr8ohBVb1OMjxLwGCvjTikrsBOiA6fNyCrm8V1rP93iVPpwaE+gO0SsWmPiXB+jikdf6SizrT5qKasx5j8ABbHpFTx+vFXp9EnYQmLx02h1QTTrl6eDqxLnGjporxl3NL3agEvXdT0WmEost648sQOYAeJS9Q7bfUVoMGnjo4AZdUMQku50McDcMWcBPvr0SzbTAFDfvJqwLzgxwATnCgnp4wDl6Aa+Ax283gghmj+vj7feE2KBBRMW3FzOpLOADl0Isb5587h/U4gGvkt5v60Z1VLG8BhYjbzRwyQZemwAd6cCR5/XFWLYZRIMpX39AR0tjaGGiGzLVyhse5C9RKC6ai42ppWPKiBagOvaYk8lO7DajerabOZP46Lby5wKjw1HCRx7p9sVMOWGzb/vA1hwiWc6jm3MvQDTogQkiqIhJV0nBQBTU+3okKCFDy9WwferkHjtxib7t3xIUQtHxnIwtx4mpg26/HfwVNVDb4oI9RHmx5WGelRVlrtiw43zboCLaxv46AZeB3IlTkwouebTr1y2NjSpHz68WNFjHvupy3q8TFn3Hos2IAk4Ju5dCo8B3wP7VPr/FGaKiG+T+v+TQqIrOqMTL1VdWV1DdmcbO8KXBz6esmYWYKPwDL5b5FA1a0hwapHiom0r/cKaoqr+27/XcrS5UwSMbQAAAABJRU5ErkJggg==)](https://deepwiki.com/go-sql-driver/mysql)
 
@@ -60,26 +141,26 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
 ## Installation
 Simple install the package to your [$GOPATH](https://github.com/golang/go/wiki/GOPATH "GOPATH") with the [go tool](https://golang.org/cmd/go/ "go command") from shell:
 ```bash
-go get -u github.com/go-sql-driver/mysql
+go get -u github.com/block/mysql
 ```
 Make sure [Git is installed](https://git-scm.com/downloads) on your machine and in your system's `PATH`.
 
 ## Usage
 _Go MySQL Driver_ is an implementation of Go's `database/sql/driver` interface. You only need to import the driver and can use the full [`database/sql`](https://golang.org/pkg/database/sql/) API then.
 
-Use `mysql` as `driverName` and a valid [DSN](#dsn-data-source-name)  as `dataSourceName`:
+Use `block-mysql` as `driverName` and a valid [DSN](#dsn-data-source-name)  as `dataSourceName`:
 
 ```go
 import (
 	"database/sql"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 )
 
 // ...
 
-db, err := sql.Open("mysql", "user:password@/dbname")
+db, err := sql.Open("block-mysql", "user:password@/dbname")
 if err != nil {
 	panic(err)
 }
