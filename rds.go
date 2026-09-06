@@ -26,32 +26,64 @@ import (
 //	curl -o rdsGlobalBundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 //
 // Adding a root is backwards compatible, so refreshing early costs nothing.
-// The bundle covers the `aws` partition only; the China partition
-// (`amazonaws.com.cn`) publishes a separate trust store, which is why rdsAddr
-// does not match its endpoint forms — see RDSTLSConfig for how to use a
-// different bundle.
+//
+// The bundle covers the commercial `aws` partition only, and contains no roots
+// for either of the other two partitions:
+//
+//	certificates:      121
+//	GovCloud roots:      0
+//	China roots:         0
+//
+// Neither gap is a hazard, because IsRDSAddr matches neither partition's
+// endpoints — see rdsAddr. Use RDSTLSConfig to connect to one, with that
+// partition's own bundle in place of this one.
 //
 //go:embed rdsGlobalBundle.pem
 var rdsGlobalBundle []byte
 
-// rdsAddr matches an Amazon RDS or Aurora endpoint, with an optional port.
+// rdsAddr matches an Amazon RDS or Aurora endpoint in the commercial `aws`
+// partition, with an optional port.
 //
 // The leading dot is load-bearing: without it the pattern also accepts
 // `notrds.amazonaws.com`, so a host outside RDS could pull a connection onto
 // the RDS trust store. That misfires safely — verification against RDS roots
 // fails, rather than trusting the wrong CA — but a confusing handshake error
 // is still worse than not matching.
-var rdsAddr = regexp.MustCompile(`\.rds\.amazonaws\.com(:\d+)?$`)
+//
+// The match is case-insensitive because DNS is: nothing normalizes cfg.Addr,
+// so a hostname that arrives uppercased from a config file or a console
+// copy-paste is the same endpoint and must get the same TLS.
+var rdsAddr = regexp.MustCompile(`(?i)\.rds\.amazonaws\.com(:\d+)?$`)
 
-// IsRDSAddr reports whether addr is an Amazon RDS or Aurora endpoint, with or
-// without a port. Connections to such an address are given TLS automatically;
-// see RDSTLSConfig.
+// govCloudAddr matches the AWS GovCloud regions, which rdsAddr would otherwise
+// accept: unlike China (`amazonaws.com.cn`), GovCloud RDS endpoints are
+// ordinary `<name>.<hash>.us-gov-<region>.rds.amazonaws.com` names that the
+// suffix check cannot distinguish.
+//
+// They are excluded because the embedded bundle has no GovCloud roots (see
+// rdsGlobalBundle). Matching them would turn a GovCloud connection that works
+// today in plaintext into one that fails verification against 121 commercial
+// roots, with an x509 error that names none of this — the same confusing
+// handshake rdsAddr's leading dot exists to avoid, reached from the other
+// direction. RDSTLSConfig is the documented path for GovCloud.
+var govCloudAddr = regexp.MustCompile(`(?i)\.us-gov-[a-z]+-\d+\.rds\.amazonaws\.com(:\d+)?$`)
+
+// IsRDSAddr reports whether addr is an Amazon RDS or Aurora endpoint in the
+// commercial `aws` partition, with or without a port. Connections to such an
+// address are given TLS automatically; see RDSTLSConfig.
+//
+// GovCloud and China endpoints report false: their roots are not in the
+// embedded bundle, so verifying against it would fail. Reach them with
+// RDSTLSConfig and that partition's bundle.
 func IsRDSAddr(addr string) bool {
-	return rdsAddr.MatchString(addr)
+	return rdsAddr.MatchString(addr) && !govCloudAddr.MatchString(addr)
 }
 
-// rdsRootCAs parses the embedded bundle once. A CertPool is safe for
-// concurrent use once built, and every TLS config below shares this one.
+// rdsRootCAs parses the embedded bundle once, because parsing 121 certificates
+// per connection would be silly. Callers must not hand this pool out directly:
+// x509.CertPool has no copy-on-write, so appending to it would widen trust for
+// every RDS connection in the process — and would race with any handshake
+// reading it. RDSTLSConfig clones.
 var rdsRootCAs = sync.OnceValue(func() *x509.CertPool {
 	pool := x509.NewCertPool()
 	// A parse failure here would mean the embedded bundle is malformed, which
@@ -74,12 +106,20 @@ var rdsRootCAs = sync.OnceValue(func() *x509.CertPool {
 //	mysql.RegisterTLSConfig("rds", mysql.RDSTLSConfig())
 //	db, _ := sql.Open("block-mysql", "user:pass@tcp(db.internal:3306)/schema?tls=rds")
 //
-// Each call returns a new config, so it can be modified freely — to trust a
-// different partition's bundle, for instance. The returned config verifies the
+// It is also the way to reach a partition the embedded bundle does not cover
+// — GovCloud or China — by replacing or extending RootCAs with that
+// partition's own trust store.
+//
+// Each call returns a new config with its own RootCAs, so it can be modified
+// freely, including appending to the pool. The returned config verifies the
 // server name, so a proxy must present a certificate for the name dialed.
 func RDSTLSConfig() *tls.Config {
 	return &tls.Config{
-		RootCAs: rdsRootCAs(),
+		// Clone, not the shared pool: the doc above invites callers to modify
+		// the result, and appending to a shared *x509.CertPool would both widen
+		// trust for unrelated connections and race with in-flight handshakes.
+		// Clone copies the index only, so it stays cheap next to a handshake.
+		RootCAs: rdsRootCAs().Clone(),
 		// RDS has supported TLS 1.2 everywhere for years, and 1.0/1.1 are
 		// deprecated. Upstream leaves this to the Go default (currently 1.2 for
 		// clients); pinning it means a future default change cannot quietly

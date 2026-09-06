@@ -9,9 +9,13 @@
 package mysql
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -22,13 +26,29 @@ func TestIsRDSAddr(t *testing.T) {
 		addr string
 		want bool
 	}{
-		// Real endpoint shapes: instance, cluster writer, cluster reader,
-		// and a GovCloud region (still under .rds.amazonaws.com).
+		// Real endpoint shapes: instance, cluster writer, cluster reader.
 		{"mydb.cxyz123.us-east-1.rds.amazonaws.com:3306", true},
 		{"mydb.cxyz123.us-east-1.rds.amazonaws.com", true},
 		{"mycluster.cluster-cxyz123.eu-west-1.rds.amazonaws.com:3306", true},
 		{"mycluster.cluster-ro-cxyz123.eu-west-1.rds.amazonaws.com:3306", true},
-		{"mydb.cxyz123.us-gov-west-1.rds.amazonaws.com:3306", true},
+
+		// DNS is case-insensitive and nothing normalizes cfg.Addr, so these are
+		// the same endpoint as the first row and must get the same TLS. A miss
+		// here is the silent-plaintext failure this whole file exists to avoid.
+		{"mydb.cxyz123.us-east-1.RDS.amazonaws.com:3306", true},
+		{"MYDB.CXYZ123.US-EAST-1.RDS.AMAZONAWS.COM:3306", true},
+
+		// GovCloud endpoints are ordinary .rds.amazonaws.com names, so the
+		// suffix check alone accepts them — but the embedded bundle has no
+		// GovCloud roots, so auto-TLS would turn a working plaintext connection
+		// into a failing handshake. Excluded on purpose; see govCloudAddr.
+		{"mydb.cxyz123.us-gov-west-1.rds.amazonaws.com:3306", false},
+		{"mydb.cxyz123.us-gov-east-1.rds.amazonaws.com", false},
+		{"mycluster.cluster-cxyz123.US-GOV-WEST-1.rds.amazonaws.com:3306", false},
+
+		// Not a GovCloud region: the exclusion must not swallow commercial
+		// regions whose names merely contain "gov" elsewhere.
+		{"mydb.gov-thing.us-east-1.rds.amazonaws.com:3306", true},
 
 		// The leading dot in the pattern: a host that merely ends with the
 		// string is not an RDS endpoint.
@@ -39,8 +59,8 @@ func TestIsRDSAddr(t *testing.T) {
 		// other domain does not match.
 		{"mydb.cxyz123.us-east-1.rds.amazonaws.com.example.test:3306", false},
 
-		// Other partitions publish their own trust stores, so the embedded
-		// bundle would not verify them anyway (see rdsGlobalBundle).
+		// China publishes its own trust store, and its endpoints sit under a
+		// different suffix entirely, so the pattern excludes them for free.
 		{"mydb.cxyz123.rds.cn-north-1.amazonaws.com.cn:3306", false},
 
 		{"127.0.0.1:3306", false},
@@ -224,5 +244,69 @@ func TestRDSAutoTLS(t *testing.T) {
 		if a.TLS.ServerName == b.TLS.ServerName {
 			t.Errorf("both configs verify %q; the second parse overwrote the first", a.TLS.ServerName)
 		}
+		// The struct being distinct is not enough: RDSTLSConfig's doc invites
+		// callers to modify the result, and x509.CertPool has no copy-on-write.
+		// A shared pool would mean one caller appending a CA widens trust for
+		// every RDS connection in the process — and races with in-flight
+		// handshakes reading it.
+		if a.TLS.RootCAs == b.TLS.RootCAs {
+			t.Error("both configs share one *x509.CertPool; appending to one would widen trust for the other")
+		}
 	})
+
+	t.Run("appending to a returned pool does not leak", func(t *testing.T) {
+		// The documented operation — "trust a different partition's bundle" —
+		// must not reach connections that never asked for it. The appended CA
+		// has to be one the bundle does not already hold, since CertPool
+		// deduplicates by raw certificate and re-appending rdsGlobalBundle
+		// would be a no-op that passes vacuously.
+		foreign := selfSignedCAPEM(t)
+
+		pristine := RDSTLSConfig()
+
+		mutated := RDSTLSConfig()
+		if !mutated.RootCAs.AppendCertsFromPEM(foreign) {
+			t.Fatal("could not append the foreign CA to the returned pool")
+		}
+		if mutated.RootCAs.Equal(pristine.RootCAs) {
+			t.Fatal("the append did not change the pool; the test proves nothing")
+		}
+
+		if after := RDSTLSConfig(); !after.RootCAs.Equal(pristine.RootCAs) {
+			t.Error("a fresh RDSTLSConfig() pool changed after another caller appended to theirs")
+		}
+
+		cfg, err := ParseDSN("user:pass@tcp(" + rdsHost + ":3306)/db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cfg.TLS.RootCAs.Equal(pristine.RootCAs) {
+			t.Error("an auto-TLS connection sees the appended CA; the append leaked into connections that never asked for it")
+		}
+	})
+}
+
+// selfSignedCAPEM returns a PEM-encoded throwaway CA certificate, for use as a
+// root the embedded bundle definitely does not contain.
+func selfSignedCAPEM(t *testing.T) []byte {
+	t.Helper()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "block/mysql rds_test throwaway CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }

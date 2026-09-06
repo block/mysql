@@ -29,6 +29,20 @@ including `tls=false`, and `mysql.RDSTLSConfig()` returns the same
 configuration for an RDS instance reached under a name that doesn't look like
 one (a CNAME, or a proxy).
 
+It is a property of the **address**, not of the DSN string. That is what makes
+it robust inside this driver — a `ParseDSN`/`FormatDSN` round trip cannot drop
+it, unlike a `tls=<name>` that refers to an entry in a package-global registry.
+It also means a DSN produced by `FormatDSN` carries no `tls=`, so handing that
+string to something built on upstream go-sql-driver yields a *plaintext* RDS
+connection with nothing in the string to suggest otherwise. Open it with
+`block-mysql` and the behaviour comes back.
+
+Two partitions are deliberately excluded, because the embedded bundle holds no
+roots for either: China (`*.amazonaws.com.cn`, a different suffix) and GovCloud
+(`*.us-gov-*.rds.amazonaws.com`, which the suffix check alone would accept).
+Both keep whatever the DSN asks for; use `mysql.RDSTLSConfig()` with that
+partition's own bundle to verify them.
+
 ## What this fork changes
 
 Two things, both for packaging reasons only. Neither alters protocol behaviour.
