@@ -200,7 +200,6 @@ func TestIdleErrorRejectReadOnly(t *testing.T) {
 		t.Run(fmt.Sprint(number), func(t *testing.T) {
 			t.Parallel()
 			mc, server, _, _ := idleTestConn(t, 0, "none")
-			mc.cfg.RejectReadOnly = true
 			idleTestWrite(t, server, idleTestPacket(idleTestError(number, "original server error")))
 			err := mc.idleError()
 			var serverErr *MySQLError

@@ -38,7 +38,7 @@ func (mc *mysqlConn) idleError() error {
 		}
 	}
 	// This is diagnostic only: do not enforce sequence numbers, concatenate
-	// packets, or apply RejectReadOnly to the original server error.
+	// packets, or apply read-only rejection to the original server error.
 	header, err := readNext(4)
 	if err != nil {
 		return errUnexpectedRead
