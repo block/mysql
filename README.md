@@ -16,11 +16,18 @@ import path or driver name.
 | --- | --- | --- |
 | [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns the response in the shape the server chose — exactly one of `driver.Rows` or `driver.Result`. Callers handling SQL they did not write (a proxy, a REPL) otherwise have to classify statements up front to pick between `QueryContext` and `ExecContext`, and a misclassification either discards a resultset or loses the OK-packet metadata. | Raised upstream as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793), still open. Merged here as [#1](https://github.com/block/mysql/pull/1). |
 | [`Warnings()`](warnings.go) | Exposes the warning count from the OK/EOF packet that terminated the last statement — the same number MySQL reports as `@@warning_count`. Warnings themselves live in per-connection state that only `SHOW WARNINGS` can read, so the count is what makes surfacing them affordable: it says whether that round trip would return anything. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
+| [RDS auto-TLS](rds.go) | A connection to an `*.rds.amazonaws.com` endpoint verifies against Amazon's RDS root bundle, embedded here, unless the DSN asked for something else. Without it every deployment ships its own copy of the bundle and its own `tls=` wiring, and an unencrypted RDS connection is a silent omission rather than an error. | Not yet raised upstream. |
 
-Both are reached through `(*sql.Conn).Raw` and a structural interface
+The first two are reached through `(*sql.Conn).Raw` and a structural interface
 assertion, so a consumer can depend on the *capability* without a compile-time
 dependency on this module. See the doc comments in `unified.go` and
 `warnings.go` for the exact contracts.
+
+RDS auto-TLS needs no API at all: it applies to any connection whose address
+looks like an RDS or Aurora endpoint. Anything the DSN specifies still wins,
+including `tls=false`, and `mysql.RDSTLSConfig()` returns the same
+configuration for an RDS instance reached under a name that doesn't look like
+one (a CNAME, or a proxy).
 
 ## What this fork changes
 
@@ -76,9 +83,10 @@ git fetch upstream
 git merge upstream/master
 ```
 
-Edits to upstream files are confined to two things: the module path and driver
-name (`go.mod`, `driver.go`, plus doc comments and test call sites that spell
-either one out), and the CI matrix (see below). The capabilities above live in
+Edits to upstream files are confined to three things: the module path and
+driver name (`go.mod`, `driver.go`, plus doc comments and test call sites that
+spell either one out), the CI matrix (see below), and a one-line call in
+`Config.normalize` that hands off to `rds.go`. The capabilities above live in
 files upstream does not have, which is what keeps merges near-mechanical.
 Additions are cheapest when they follow the same shape: new files, or new
 methods on existing types, in preference to reworking an upstream code path.
