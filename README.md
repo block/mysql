@@ -2,17 +2,20 @@
 
 **A tracking fork of [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql).**
 
-Upstream is merged forward regularly and the delta is kept deliberately small:
-this fork carries a short list of additive capabilities that upstream has not
-adopted, and nothing else. The upstream README follows below the separator,
-edited only where it names the import path or driver name.
+Block depends on a small number of additive capabilities that aren't in
+upstream yet. This fork exists to carry them until they are, and nothing more:
+upstream is merged forward regularly and the delta is kept deliberately small,
+so the fork can be retired if and when upstream adopts them.
+
+The upstream README follows below the separator, edited only where it names the
+import path or driver name.
 
 ## What this fork adds
 
 | Capability | What it is | Upstream status |
 | --- | --- | --- |
-| [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns the response in the shape the server chose — exactly one of `driver.Rows` or `driver.Result`. Callers handling SQL they did not write (a proxy, a REPL) otherwise have to classify statements up front to pick between `QueryContext` and `ExecContext`, and a misclassification either discards a resultset or loses the OK-packet metadata. | Proposed as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793); no maintainer response. Merged here as [#1](https://github.com/block/mysql/pull/1). |
-| [`Warnings()`](warnings.go) | Exposes the warning count from the OK/EOF packet that terminated the last statement — the same number MySQL reports as `@@warning_count`. Warnings themselves live in per-connection state that only `SHOW WARNINGS` can read, so the count is what makes surfacing them affordable: it says whether that round trip would return anything. | Not proposed upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
+| [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns the response in the shape the server chose — exactly one of `driver.Rows` or `driver.Result`. Callers handling SQL they did not write (a proxy, a REPL) otherwise have to classify statements up front to pick between `QueryContext` and `ExecContext`, and a misclassification either discards a resultset or loses the OK-packet metadata. | Raised upstream as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793), still open. Merged here as [#1](https://github.com/block/mysql/pull/1). |
+| [`Warnings()`](warnings.go) | Exposes the warning count from the OK/EOF packet that terminated the last statement — the same number MySQL reports as `@@warning_count`. Warnings themselves live in per-connection state that only `SHOW WARNINGS` can read, so the count is what makes surfacing them affordable: it says whether that round trip would return anything. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
 
 Both are reached through `(*sql.Conn).Raw` and a structural interface
 assertion, so a consumer can depend on the *capability* without a compile-time
