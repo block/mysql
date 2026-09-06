@@ -57,6 +57,17 @@ silently returns false rather than failing loudly. Be deliberate about which
 package each error-inspection site imports, and prefer moving code you control
 onto one of the two.
 
+The other silent case is `sql.Open`. Registries in this package are
+package-level globals, so a `RegisterTLSConfig`/`RegisterLocalFile`/
+`RegisterDialContext` call made against the wrong import path errors on use with
+a message that names the cause — a migration chore, not a trap. A call site that
+still says `sql.Open("mysql", …)`, however, resolves to whatever upstream's
+`init` registered, connects, and behaves correctly until something reaches for
+`QueryResultContext` or `Warnings()` through `(*sql.Conn).Raw` and the structural
+assertion fails. Note the asymmetry: with upstream *not* in the dependency graph
+the same mistake is benign, failing immediately with `sql: unknown driver
+"mysql"`. Grep for the literal when both are linked.
+
 ## Staying current
 
 ```bash
@@ -78,10 +89,12 @@ Narrower than upstream, and deliberately so — CI covers **Linux with MySQL LTS
 (9.7, 8.4, 8.0)**, plus the two previous Go releases against the newest MySQL.
 
 Upstream additionally tests macOS and Windows runners and four MariaDB
-versions. Block deploys none of those, so the fork drops them: 5 CI jobs rather
-than 25, and no exposure to the Windows-runner TCP dial flake that upstream's
-own CI also hits. Nothing about the driver is Linux- or MySQL-specific — the
-platforms are merely untested here, so treat upstream as the authority on them.
+versions. Block deploys none of those, so the fork drops them: 21 matrix
+combinations become 3 (5 test jobs rather than 23, counting the two appended
+older-Go entries), and no exposure to the Windows-runner TCP dial flake that
+upstream's own CI also hits. Nothing about the driver is Linux- or
+MySQL-specific — the platforms are merely untested here, so treat upstream as
+the authority on them.
 
 ## License
 
@@ -652,14 +665,14 @@ See [context support in the database/sql package](https://golang.org/doc/go1.8#d
 ### `LOAD DATA LOCAL INFILE` support
 For this feature you need direct access to the package. Therefore you must change the import path (no `_`):
 ```go
-import "github.com/go-sql-driver/mysql"
+import "github.com/block/mysql"
 ```
 
 Files must be explicitly allowed by registering them with `mysql.RegisterLocalFile(filepath)` (recommended) or the allowlist check must be deactivated by using the DSN parameter `allowAllFiles=true` ([*Might be insecure!*](https://dev.mysql.com/doc/refman/8.0/en/load-data.html#load-data-local)).
 
 To use a `io.Reader` a handler function must be registered with `mysql.RegisterReaderHandler(name, handler)` which returns a `io.Reader` or `io.ReadCloser`. The Reader is available with the filepath `Reader::<name>` then. Choose different names for different handlers and `DeregisterReaderHandler` when you don't need it anymore.
 
-See the [godoc of Go-MySQL-Driver](https://godoc.org/github.com/go-sql-driver/mysql "golang mysql driver documentation") for details.
+See the [godoc of this fork](https://pkg.go.dev/github.com/block/mysql "golang mysql driver documentation") for details.
 
 
 ### `time.Time` support
