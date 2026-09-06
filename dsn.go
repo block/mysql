@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +44,7 @@ type Config struct {
 	Net                  string            // Network (e.g. "tcp", "tcp6", "unix". default: "tcp")
 	Addr                 string            // Address (default: "127.0.0.1:3306" for "tcp" and "/tmp/mysql.sock" for "unix")
 	DBName               string            // Database name
-	Params               map[string]string // Connection parameters
+	Params               map[string]string // Connection parameters. Use Apply(AddParam(...)) to preserve insertion order.
 	ConnectionAttributes string            // Connection Attributes, comma-delimited string of user-defined "key:value" pairs
 	Collation            string            // Connection collation. When set, this will be set in SET NAMES <charset> COLLATE <collation> query
 	Loc                  *time.Location    // Location for time.Time values
@@ -79,10 +80,12 @@ type Config struct {
 	compress       bool // Enable zlib compression
 	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
 
-	beforeConnect func(context.Context, *Config) error // Invoked before a connection is established
-	pubKey        *rsa.PublicKey                       // Server public key
-	timeTruncate  time.Duration                        // Truncate time.Time values to the specified duration
-	charsets      []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
+	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
+	encodedAttributes string                               // Encoded connection attributes
+	paramOrder        []string                             // Order of connection parameters parsed from the DSN
+	pubKey            *rsa.PublicKey                       // Server public key
+	timeTruncate      time.Duration                        // Truncate time.Time values to the specified duration
+	charsets          []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
 }
 
 // Functional Options Pattern
@@ -113,6 +116,27 @@ func (c *Config) Apply(opts ...Option) error {
 	return nil
 }
 
+// AddParam adds a connection parameter.
+//
+// Parameters added with AddParam retain their order in [Config.FormatDSN] and
+// are applied to the connection in that order. If name already exists, it is
+// moved to the end of the parameter order.
+func AddParam(name, value string) Option {
+	return func(cfg *Config) error {
+		params := cfg.orderedParams()
+		if i := slices.Index(params, name); i >= 0 {
+			params = slices.Delete(params, i, i+1)
+		}
+
+		if cfg.Params == nil {
+			cfg.Params = make(map[string]string)
+		}
+		cfg.Params[name] = value
+		cfg.paramOrder = append(params, name)
+		return nil
+	}
+}
+
 // TimeTruncate sets the time duration to truncate time.Time values in
 // query parameters.
 func TimeTruncate(d time.Duration) Option {
@@ -123,6 +147,9 @@ func TimeTruncate(d time.Duration) Option {
 }
 
 // BeforeConnect sets the function to be invoked before a connection is established.
+// If the function changes [Config.Addr] while [Config.TLS] is non-nil and its
+// InsecureSkipVerify field is false, it must also update ServerName to match
+// the hostname in the new address.
 func BeforeConnect(fn func(context.Context, *Config) error) Option {
 	return func(cfg *Config) error {
 		cfg.beforeConnect = fn
@@ -166,10 +193,11 @@ func (cfg *Config) Clone() *Config {
 	if cp.TLS != nil {
 		cp.TLS = cfg.TLS.Clone()
 	}
-	if len(cp.Params) > 0 {
+	if cp.Params != nil {
 		cp.Params = make(map[string]string, len(cfg.Params))
 		maps.Copy(cp.Params, cfg.Params)
 	}
+	cp.paramOrder = slices.Clone(cfg.paramOrder)
 	if cfg.pubKey != nil {
 		cp.pubKey = &rsa.PublicKey{
 			N: new(big.Int).Set(cfg.pubKey.N),
@@ -239,6 +267,7 @@ func (cfg *Config) normalize() error {
 	if cfg.Logger == nil {
 		cfg.Logger = defaultLogger
 	}
+	cfg.encodedAttributes = encodeConnectionAttributes(cfg)
 
 	return nil
 }
@@ -398,18 +427,37 @@ func (cfg *Config) FormatDSN() string {
 	}
 
 	// other params
-	if cfg.Params != nil {
-		var params []string
-		for param := range cfg.Params {
-			params = append(params, param)
-		}
-		sort.Strings(params)
-		for _, param := range params {
-			writeDSNParam(&buf, &hasParam, param, url.QueryEscape(cfg.Params[param]))
-		}
+	for _, param := range cfg.orderedParams() {
+		writeDSNParam(&buf, &hasParam, param, url.QueryEscape(cfg.Params[param]))
 	}
 
 	return buf.String()
+}
+
+// orderedParams returns connection parameter names in their recorded order,
+// followed by any names added directly to Config.Params in sorted order.
+func (cfg *Config) orderedParams() []string {
+	params := make([]string, 0, len(cfg.Params))
+	seen := make(map[string]struct{}, len(cfg.Params))
+	for _, param := range cfg.paramOrder {
+		if _, ok := cfg.Params[param]; !ok {
+			continue
+		}
+		if _, ok := seen[param]; ok {
+			continue
+		}
+		params = append(params, param)
+		seen[param] = struct{}{}
+	}
+
+	unordered := make([]string, 0, len(cfg.Params)-len(params))
+	for param := range cfg.Params {
+		if _, ok := seen[param]; !ok {
+			unordered = append(unordered, param)
+		}
+	}
+	sort.Strings(unordered)
+	return append(params, unordered...)
 }
 
 // ParseDSN parses the DSN string to a Config
@@ -706,14 +754,23 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			cfg.ConnectionAttributes = connectionAttributes
 
 		default:
+			value, err = url.QueryUnescape(value)
+			if err != nil {
+				return
+			}
+
 			// lazy init
 			if cfg.Params == nil {
 				cfg.Params = make(map[string]string)
 			}
 
-			if cfg.Params[key], err = url.QueryUnescape(value); err != nil {
-				return
+			// Keep the last occurrence of a duplicate parameter, matching the
+			// existing map semantics, and place it at its last position.
+			if i := slices.Index(cfg.paramOrder, key); i >= 0 {
+				cfg.paramOrder = slices.Delete(cfg.paramOrder, i, i+1)
 			}
+			cfg.Params[key] = value
+			cfg.paramOrder = append(cfg.paramOrder, key)
 		}
 	}
 

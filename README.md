@@ -482,6 +482,8 @@ Rules:
 * The values for string variables must be quoted with `'`.
 * The values must also be [url.QueryEscape](http://golang.org/pkg/net/url/#QueryEscape)'ed!
  (which implies values of string variables must be wrapped with `%27`).
+* System variables are set and retained by `FormatDSN` in the order they appear in the DSN.
+  Use `Config.Apply(AddParam(name, value))` to preserve order when adding them programmatically.
 
 Examples:
   * `autocommit=1`: `SET autocommit=1`
