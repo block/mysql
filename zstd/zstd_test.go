@@ -47,7 +47,7 @@ func TestDriverDependencyBoundary(t *testing.T) {
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}
-	dependencies, err := exec.Command(goPath, "list", "-deps", "github.com/go-sql-driver/mysql").CombinedOutput()
+	dependencies, err := exec.Command(goPath, "list", "-deps", "github.com/block/mysql").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go list: %v\n%s", err, dependencies)
 	}

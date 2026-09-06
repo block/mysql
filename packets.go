@@ -20,7 +20,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-sql-driver/mysql/internal/compression"
+	"github.com/block/mysql/internal/compression"
 )
 
 // MySQL client/server protocol documentations.
