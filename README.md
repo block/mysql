@@ -65,12 +65,24 @@ git fetch upstream
 git merge upstream/master
 ```
 
-Edits to upstream files are confined to the module path and driver name
-(`go.mod`, `driver.go`, plus doc comments and test call sites that spell either
-one out); the capabilities above live in files upstream does not have. That
-keeps merges near-mechanical, and keeping it that way is a maintenance
-requirement rather than a preference: anything that changes upstream's connect,
-TLS, or packet paths belongs in a wrapper package, not here.
+Edits to upstream files are confined to two things: the module path and driver
+name (`go.mod`, `driver.go`, plus doc comments and test call sites that spell
+either one out), and the CI matrix (see below). The capabilities above live in
+files upstream does not have. That keeps merges near-mechanical, and keeping it
+that way is a maintenance requirement rather than a preference: anything that
+changes upstream's connect, TLS, or packet paths belongs in a wrapper package,
+not here.
+
+## Supported platforms
+
+Narrower than upstream, and deliberately so — CI covers **Linux with MySQL LTS
+(9.7, 8.4, 8.0)**, plus the two previous Go releases against the newest MySQL.
+
+Upstream additionally tests macOS and Windows runners and four MariaDB
+versions. Block deploys none of those, so the fork drops them: 5 CI jobs rather
+than 25, and no exposure to the Windows-runner TCP dial flake that upstream's
+own CI also hits. Nothing about the driver is Linux- or MySQL-specific — the
+platforms are merely untested here, so treat upstream as the authority on them.
 
 ## License
 
