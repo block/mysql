@@ -622,6 +622,20 @@ func (mc *mysqlConn) handleErrorPacket(data []byte) error {
 		// the application's own SET is not exempt — nothing distinguishes it
 		// from a demoted writer.
 		//
+		// Log before discarding it. On the failover this is written for the
+		// caller never sees anything — database/sql retries onto a healthy
+		// connection — so one line is the whole trace. On a target that is
+		// *persistently* read-only (a reader endpoint, a cluster with no
+		// writer, super_read_only left on after maintenance) database/sql
+		// burns its retry budget and hands the caller a bare
+		// driver.ErrBadConn; without this, the server's own message — the only
+		// text that names the actual problem — is assembled nowhere.
+		msg := data[3:]
+		if len(msg) > 6 && msg[0] == 0x23 {
+			msg = msg[6:] // skip the "#HY000" SQL-state marker, as below
+		}
+		mc.log("closing read-only connection, errno ", errno, ": ", string(msg))
+
 		// We explicitly close the connection before returning
 		// driver.ErrBadConn to ensure that `database/sql` purges this
 		// connection and initiates a new one for next statement next time.

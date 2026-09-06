@@ -803,6 +803,14 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 		return driver.ErrBadConn
 	}
 
+	// Fork addition: re-establish the read-only-transaction exemption for the
+	// new borrower. Commit and Rollback both clear it and every sql.Tx ends in
+	// one of them, so this is hardening rather than a fix — but the direction
+	// it can get stuck in, true, silently disables the read-only rejection for
+	// the rest of this connection's life, and a pooled connection's
+	// assumptions belong here. See packets.go.
+	mc.inReadOnlyTx = false
+
 	// Perform a stale connection check. We only perform this check for
 	// the first query on a connection that has been checked out of the
 	// connection pool: a fresh connection from the pool is more likely

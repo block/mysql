@@ -9,6 +9,7 @@
 package mysql
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/binary"
 	"errors"
@@ -103,6 +104,105 @@ func TestReadOnlyTxIsExempt(t *testing.T) {
 	if err := mc.handleErrorPacket(errPacket(1792, "read-only")); !errors.Is(err, driver.ErrBadConn) {
 		t.Errorf("after the transaction, errno 1792 returned %v, want driver.ErrBadConn", err)
 	}
+}
+
+// TestReadOnlyTxLifecycle drives the exemption flag through begin, Commit,
+// Rollback and ResetSession, which is the only place it can actually go wrong
+// and the reason the field exists.
+//
+// TestReadOnlyTxIsExempt above proves handleErrorPacket *reads* the flag
+// correctly, but it sets the field itself, so it cannot tell a flag that is
+// cleared from one that nobody ever clears. A flag stuck true silently
+// disables the read-only rejection for the rest of the connection's life in
+// the pool — the whole feature off, with no symptom.
+func TestReadOnlyTxLifecycle(t *testing.T) {
+	// beginTx runs a scripted START TRANSACTION against a mock server and
+	// returns the connection with the flag in whatever state begin left it.
+	beginTx := func(t *testing.T, readOnly bool) (*mockConn, *mysqlConn, driver.Tx) {
+		t.Helper()
+		conn, mc := newRWMockConn(0)
+		conn.queuedReplies = [][]byte{okPacket()}
+		tx, err := mc.begin(readOnly)
+		if err != nil {
+			t.Fatalf("begin(%v): %v", readOnly, err)
+		}
+		return conn, mc, tx
+	}
+
+	// rejects reports what a read-only error does on this connection now.
+	rejects := func(mc *mysqlConn) bool {
+		return errors.Is(mc.handleErrorPacket(errPacket(1792, "read-only")), driver.ErrBadConn)
+	}
+
+	t.Run("a read-only transaction sets it", func(t *testing.T) {
+		_, mc, _ := beginTx(t, true)
+		if !mc.inReadOnlyTx {
+			t.Error("begin(true) did not set inReadOnlyTx; the caller's own read-only transaction would be rejected")
+		}
+	})
+
+	t.Run("a read-write transaction does not", func(t *testing.T) {
+		// This is the direction that disarms the feature: if begin set the
+		// flag unconditionally, any connection that had ever run a BeginTx
+		// would stop rejecting read-only errors.
+		_, mc, _ := beginTx(t, false)
+		if mc.inReadOnlyTx {
+			t.Error("begin(false) set inReadOnlyTx; an ordinary transaction would exempt the connection from read-only rejection")
+		}
+		if !rejects(mc) {
+			t.Error("a read-only error inside a read-write transaction was not rejected")
+		}
+	})
+
+	t.Run("Commit clears it", func(t *testing.T) {
+		conn, mc, tx := beginTx(t, true)
+		conn.queuedReplies = [][]byte{okPacket()}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("Commit: %v", err)
+		}
+		if mc.inReadOnlyTx {
+			t.Fatal("Commit left inReadOnlyTx set")
+		}
+		if !rejects(mc) {
+			t.Error("after Commit a read-only error was still exempt; one read-only transaction disarmed the connection for good")
+		}
+	})
+
+	t.Run("Rollback clears it", func(t *testing.T) {
+		conn, mc, tx := beginTx(t, true)
+		conn.queuedReplies = [][]byte{okPacket()}
+		if err := tx.Rollback(); err != nil {
+			t.Fatalf("Rollback: %v", err)
+		}
+		if mc.inReadOnlyTx {
+			t.Fatal("Rollback left inReadOnlyTx set")
+		}
+		if !rejects(mc) {
+			t.Error("after Rollback a read-only error was still exempt")
+		}
+	})
+
+	t.Run("ResetSession clears it", func(t *testing.T) {
+		// Belt and braces: every sql.Tx ends in Commit or Rollback, so this
+		// should be unreachable — but it is the point where a pooled
+		// connection's assumptions are re-established for a new borrower, and
+		// the stuck direction of this flag is the unsafe one.
+		_, mc, _ := beginTx(t, true)
+		if err := mc.ResetSession(context.Background()); err != nil {
+			t.Fatalf("ResetSession: %v", err)
+		}
+		if mc.inReadOnlyTx {
+			t.Error("ResetSession left inReadOnlyTx set; the next borrower inherits the exemption")
+		}
+	})
+}
+
+// okPacket builds a minimal OK packet: header (length, sequence 1), then the
+// 0x00 marker, zero affected rows, zero last-insert-id, autocommit status and
+// no warnings. Sequence 1 is what the server answers a freshly written command
+// with, which is what mc.exec expects back.
+func okPacket() []byte {
+	return []byte{7, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0}
 }
 
 // errPacket builds the ERR packet body handleErrorPacket expects: the 0xff

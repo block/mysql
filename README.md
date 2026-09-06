@@ -106,7 +106,7 @@ git fetch upstream
 git merge upstream/master
 ```
 
-Edits to upstream files are confined to three things: the module path and
+Edits to upstream files are confined to four things: the module path and
 driver name (`go.mod`, `driver.go`, plus doc comments and test call sites that
 spell either one out), the CI matrix (see below), a one-line call in
 `Config.normalize` that hands off to `rds.go`, and the read-only rejection (one
@@ -568,9 +568,23 @@ Two consequences worth knowing:
   READ ONLY` is *not* exempt — nothing distinguishes it from a demoted writer.
   Writes on such a session are retried on a new connection instead of failing.
   Use privileges, or the `ReadOnly` transaction option, to express that intent.
-* ERROR 1290 is also raised for some conditions unrelated to read-only mode.
-  Those are now retried too, and if the condition persists the caller sees
-  `driver.ErrBadConn` rather than the original error.
+* ERROR 1290 is also raised for conditions unrelated to failover — the ones you
+  are likely to meet are `secure_file_priv` (a `SELECT … INTO OUTFILE` or `LOAD
+  DATA` outside the permitted directory), `super_read_only`, `innodb_read_only`
+  and `--skip-grant-tables`. All of these persist rather than clear, so the
+  statement is retried, the connection churned, and the caller finally sees
+  `driver.ErrBadConn` rather than the message that named the problem. The
+  driver logs the server's own error before discarding it, so the condition is
+  still identifiable — look for `closing read-only connection` in the log.
+
+**If your target is deliberately read-only** — an Aurora reader endpoint, a
+replica, a source you only ever read from — this fork is a poor fit for that
+connection, and there is no longer an option to turn it off. Wrap reads in
+`sql.TxOptions{ReadOnly: true}` and they are exempt; anything on autocommit
+that the server rejects will still be retried and churned. If that is not
+workable, use a driver that lets you disable the behaviour for that connection.
+The trade is deliberate: the population this fork serves writes to RDS
+primaries, where the silent failure is the more expensive one.
 
 
 ##### `serverPubKey`
