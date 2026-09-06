@@ -7,7 +7,7 @@
 // Package zstd enables automatic Zstandard compression for MySQL connections
 // with compression enabled. Import it for its side effects:
 //
-//	import _ "github.com/go-sql-driver/mysql/zstd"
+//	import _ "github.com/block/mysql/zstd"
 //
 // This also registers the mysql database/sql driver. Connections use zstd when
 // the server supports it and fall back to zlib otherwise. Compression remains
@@ -17,8 +17,8 @@ package zstd
 import (
 	"sync"
 
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/go-sql-driver/mysql/internal/compression"
+	_ "github.com/block/mysql"
+	"github.com/block/mysql/internal/compression"
 	"github.com/klauspost/compress/zstd"
 )
 

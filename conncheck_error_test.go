@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql/internal/compression"
+	"github.com/block/mysql/internal/compression"
 	"github.com/klauspost/compress/zstd"
 )
 

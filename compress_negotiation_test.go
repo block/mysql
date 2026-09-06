@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/go-sql-driver/mysql/internal/compression"
+	"github.com/block/mysql/internal/compression"
 )
 
 // Only negotiation uses this codec. Real zstd exchanges are tested in mysql/zstd
