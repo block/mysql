@@ -68,10 +68,9 @@ git merge upstream/master
 Edits to upstream files are confined to two things: the module path and driver
 name (`go.mod`, `driver.go`, plus doc comments and test call sites that spell
 either one out), and the CI matrix (see below). The capabilities above live in
-files upstream does not have. That keeps merges near-mechanical, and keeping it
-that way is a maintenance requirement rather than a preference: anything that
-changes upstream's connect, TLS, or packet paths belongs in a wrapper package,
-not here.
+files upstream does not have, which is what keeps merges near-mechanical.
+Additions are cheapest when they follow the same shape: new files, or new
+methods on existing types, in preference to reworking an upstream code path.
 
 ## Supported platforms
 
