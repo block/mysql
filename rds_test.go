@@ -68,14 +68,13 @@ func TestRDSGlobalBundleParses(t *testing.T) {
 	if !pool.AppendCertsFromPEM(rdsGlobalBundle) {
 		t.Fatal("x509: no certificates in the embedded RDS bundle could be parsed")
 	}
-	if n := len(pool.Subjects()); n != blocks { //nolint:staticcheck // Subjects() is fine for a pool we built ourselves
-		t.Errorf("pool holds %d certificates, bundle has %d PEM blocks — some failed to parse", n, blocks)
-	}
-
-	// A bundle whose roots have all expired parses fine and then fails every
-	// verification. Expired roots are normal (Amazon leaves superseded ones in
-	// place), so require only that some usable ones remain.
-	var live int
+	// AppendCertsFromPEM reports success if it parsed *any* certificate, so
+	// walk the bundle to catch the case where most of it failed to parse.
+	// Counting unexpired roots at the same time: a bundle whose roots have all
+	// expired parses fine and then fails every verification. Expired roots are
+	// normal (Amazon leaves superseded ones in place), so require only that
+	// some usable ones remain.
+	var parsed, live int
 	for rest := rdsGlobalBundle; ; {
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
@@ -87,16 +86,21 @@ func TestRDSGlobalBundleParses(t *testing.T) {
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
+			t.Errorf("certificate %d in the embedded RDS bundle does not parse: %v", parsed+1, err)
 			continue
 		}
+		parsed++
 		if time.Now().Before(cert.NotAfter) {
 			live++
 		}
 	}
+	if parsed != blocks {
+		t.Errorf("parsed %d certificates, bundle has %d PEM blocks", parsed, blocks)
+	}
 	if live == 0 {
 		t.Error("every root in the embedded RDS bundle has expired; refresh it (see rdsGlobalBundle)")
 	}
-	t.Logf("embedded RDS bundle: %d roots, %d unexpired", blocks, live)
+	t.Logf("embedded RDS bundle: %d roots, %d unexpired", parsed, live)
 }
 
 // TestRDSAutoTLS covers what normalize() does with an RDS address, which is
