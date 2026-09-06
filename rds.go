@@ -26,10 +26,10 @@ import (
 //	curl -o rdsGlobalBundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 //
 // Adding a root is backwards compatible, so refreshing early costs nothing.
-// The bundle covers the `aws` partition only; the China (`amazonaws.com.cn`)
-// and GovCloud partitions publish separate trust stores, which is also why
-// rdsAddr does not match their endpoint forms — see RDSTLSConfig for how to
-// use a different bundle.
+// The bundle covers the `aws` partition only; the China partition
+// (`amazonaws.com.cn`) publishes a separate trust store, which is why rdsAddr
+// does not match its endpoint forms — see RDSTLSConfig for how to use a
+// different bundle.
 //
 //go:embed rdsGlobalBundle.pem
 var rdsGlobalBundle []byte
