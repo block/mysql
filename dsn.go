@@ -231,6 +231,11 @@ func (cfg *Config) normalize() error {
 		cfg.Addr = ensureHavePort(cfg.Addr)
 	}
 
+	// Fork addition: an RDS endpoint with no TLS asked for in the DSN gets the
+	// embedded RDS trust store. Runs before the switch below so that anything
+	// the DSN did specify still wins. See rds.go.
+	cfg.applyRDSAutoTLS()
+
 	if cfg.TLS == nil {
 		switch cfg.TLSConfig {
 		case "false", "":
