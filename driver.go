@@ -6,14 +6,17 @@
 
 // Package mysql provides a MySQL driver for Go's database/sql package.
 //
-// The driver should be used via the database/sql package:
+// This is Block's tracking fork of github.com/go-sql-driver/mysql. It
+// registers itself as "block-mysql" rather than "mysql" so that it can be
+// linked alongside upstream without a duplicate-registration panic:
 //
 //	import "database/sql"
-//	import _ "github.com/go-sql-driver/mysql"
+//	import _ "github.com/block/mysql"
 //
-//	db, err := sql.Open("mysql", "user:password@/dbname")
+//	db, err := sql.Open("block-mysql", "user:password@/dbname")
 //
-// See https://github.com/go-sql-driver/mysql#usage for details
+// See https://github.com/block/mysql#usage for details, and the README for
+// what this fork adds over upstream.
 package mysql
 
 import (
@@ -88,8 +91,12 @@ func (d MySQLDriver) Open(dsn string) (driver.Conn, error) {
 }
 
 // This variable can be replaced with -ldflags like below:
-// go build "-ldflags=-X github.com/go-sql-driver/mysql.driverName=custom"
-var driverName = "mysql"
+// go build "-ldflags=-X github.com/block/mysql.driverName=custom"
+//
+// It is "block-mysql" rather than upstream's "mysql" because a build whose
+// dependency graph still reaches upstream go-sql-driver links both packages,
+// and two sql.Register calls under one name panic at init.
+var driverName = "block-mysql"
 
 func init() {
 	if driverName != "" {

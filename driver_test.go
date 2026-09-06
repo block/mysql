@@ -36,7 +36,7 @@ import (
 )
 
 // This variable can be replaced with -ldflags like below:
-// go test "-ldflags=-X github.com/go-sql-driver/mysql.driverNameTest=custom"
+// go test "-ldflags=-X github.com/block/mysql.driverNameTest=custom"
 var driverNameTest string
 
 func init() {
@@ -224,7 +224,7 @@ func runTestsParallel(t *testing.T, dsn string, tests ...func(dbt *DBTest, table
 			t.Parallel()
 
 			tableName := newTableName(t)
-			db, err := sql.Open("mysql", dsn)
+			db, err := sql.Open(driverNameTest, dsn)
 			if err != nil {
 				t.Fatalf("error connecting: %s", err.Error())
 			}
@@ -243,7 +243,7 @@ func runTestsParallel(t *testing.T, dsn string, tests ...func(dbt *DBTest, table
 				t.Parallel()
 
 				tableName := newTableName(t)
-				db, err := sql.Open("mysql", dsn2)
+				db, err := sql.Open(driverNameTest, dsn2)
 				if err != nil {
 					t.Fatalf("error connecting: %s", err.Error())
 				}
@@ -3583,7 +3583,7 @@ func TestErrorInMultiResult(t *testing.T) {
 	// https://github.com/go-sql-driver/mysql/issues/1361
 	var db *sql.DB
 	if _, err := ParseDSN(dsn); err != errInvalidDSNUnsafeCollation {
-		db, err = sql.Open("mysql", dsn)
+		db, err = sql.Open(driverNameTest, dsn)
 		if err != nil {
 			t.Fatalf("error connecting: %s", err.Error())
 		}

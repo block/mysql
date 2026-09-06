@@ -34,14 +34,12 @@ jobs:
               '1.26',
               '1.25',
           ]
-          mysql = [  # LTS versions
+          # MySQL LTS versions. Upstream also covers MariaDB; this fork does
+          # not, because Block does not deploy against it.
+          mysql = [
               '9.7',
               '8.4',
               '8.0',
-              'mariadb-12.3',
-              'mariadb-11.8',
-              'mariadb-11.4',
-              'mariadb-10.11',
           ]
 
           includes = []
@@ -50,8 +48,10 @@ jobs:
               includes.append({'os': 'ubuntu-latest', 'go': v, 'mysql': mysql[0]})
 
           matrix = {
-              # OS vs MySQL versions
-              'os': [ 'ubuntu-latest', 'macos-latest', 'windows-latest' ],
+              # MySQL versions. Upstream also runs macos-latest and
+              # windows-latest; this fork is Linux-only, which additionally
+              # avoids a Windows-runner TCP dial flake upstream sees too.
+              'os': [ 'ubuntu-latest' ],
               'go': [ go[0] ],
               'mysql': mysql,
 
