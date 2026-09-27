@@ -2,10 +2,9 @@
 
 **A tracking fork of [go-sql-driver/mysql](https://github.com/go-sql-driver/mysql).**
 
-Block depends on a small number of additive capabilities that aren't in
-upstream yet. This fork exists to carry them until they are, and nothing more:
-upstream is merged forward regularly and the delta is kept deliberately small,
-so the fork can be retired if and when upstream adopts them.
+Block depends on a small number of capabilities and defaults that differ from
+upstream. This fork carries those changes while upstream is merged forward
+regularly, with the delta kept deliberately small.
 
 The upstream README follows below the separator, edited only where it names the
 import path or driver name.
@@ -14,14 +13,21 @@ import path or driver name.
 
 | Capability | What it is | Upstream status |
 | --- | --- | --- |
-| [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns the response in the shape the server chose — exactly one of `driver.Rows` or `driver.Result`. Callers handling SQL they did not write (a proxy, a REPL) otherwise have to classify statements up front to pick between `QueryContext` and `ExecContext`, and a misclassification either discards a resultset or loses the OK-packet metadata. | Raised upstream as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793), still open. Merged here as [#1](https://github.com/block/mysql/pull/1). |
-| [`Warnings()`](warnings.go) | Exposes the warning count from the OK/EOF packet that terminated the last statement — the same number MySQL reports as `@@warning_count`. Warnings themselves live in per-connection state that only `SHOW WARNINGS` can read, so the count is what makes surfacing them affordable: it says whether that round trip would return anything. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
-| [RDS auto-TLS](rds.go) | A connection to an `*.rds.amazonaws.com` endpoint verifies against Amazon's RDS root bundle, embedded here, unless the DSN asked for something else. Without it every deployment ships its own copy of the bundle and its own `tls=` wiring, and an unencrypted RDS connection is a silent omission rather than an error. | Not yet raised upstream. |
+| [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns either `driver.Rows` or `driver.Result`, matching the server response. | Raised as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793). Merged here as [#1](https://github.com/block/mysql/pull/1). |
+| [`Warnings()`](warnings.go) | Exposes the warning count from the last statement, so callers can decide whether to fetch `SHOW WARNINGS`. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
+| [Reset transaction sessions before returning to the pool](#transaction-session-cleanup) | Clears session state after commit, rollback, or cancellation, then restores configured defaults. Failed cleanup discards the connection. | [Cancellation bug report draft](BUG.md); not yet filed upstream. |
+| [Auto TLS for RDS hosts](#auto-tls-for-rds-hosts) | Automatically verifies RDS and Aurora endpoints against the embedded Amazon RDS root bundle. Explicit DSN settings take precedence. | Not yet raised upstream. Merged here as [#4](https://github.com/block/mysql/pull/4). |
+| [Driver name changed to `block-mysql`](#module-path-and-driver-name) | Allows this fork and upstream's `mysql` driver to coexist without duplicate registration. | N/A |
+| [Module path changed to `github.com/block/mysql`](#module-path-and-driver-name) | Makes the fork an explicit dependency that survives across module boundaries. | N/A |
+| [Always reject read-only connections](#read-only-connections) | Discards connections to a demoted writer after failover. Explicit read-only transactions remain exempt. | Fork policy; merged here as [#5](https://github.com/block/mysql/pull/5). |
+| [Test platforms reduced to a smaller set](.github/workflows/test.yml) | Tests Linux with MySQL 8.0, 8.4, and 9.7, plus the two previous Go releases against the newest MySQL. Other upstream platforms are untested here. | N/A |
 
 The first two are reached through `(*sql.Conn).Raw` and a structural interface
 assertion, so a consumer can depend on the *capability* without a compile-time
 dependency on this module. See the doc comments in `unified.go` and
 `warnings.go` for the exact contracts.
+
+### Auto TLS for RDS hosts
 
 RDS auto-TLS needs no API at all: it applies to any connection whose address
 looks like an RDS or Aurora endpoint. Anything the DSN specifies still wins,
@@ -43,10 +49,7 @@ roots for either: China (`*.amazonaws.com.cn`, a different suffix) and GovCloud
 Both keep whatever the DSN asks for; use `mysql.RDSTLSConfig()` with that
 partition's own bundle to verify them.
 
-## What this fork changes
-
-Three things. The first two are packaging; neither alters protocol
-behaviour. The third changes a default, deliberately.
+### Module path and driver name
 
 **The module path is `github.com/block/mysql`.** Upstream's path plus a
 `replace` directive would work for a binary, but `replace` is not inherited
@@ -67,6 +70,8 @@ connections with:
 db, err := sql.Open("block-mysql", dsn)
 ```
 
+### Read-only connections
+
 **Read-only connections are always rejected.** Upstream's `rejectReadOnly`
 option defaults to off; here the behaviour is unconditional and
 `Config.RejectReadOnly` is gone. RDS and Aurora fail over by moving DNS, so a
@@ -74,6 +79,8 @@ pooled connection to the demoted writer stays open and every write on it fails
 until the process restarts — with nothing in the DSN or the error to say the
 connection is the problem. See the `rejectReadOnly` parameter below for what
 happens to a DSN that still sets it.
+
+### Transaction session cleanup
 
 **Transaction sessions are reset before returning to the pool.** After a
 transaction started through `Begin` or `BeginTx`, the driver sends
@@ -102,7 +109,7 @@ returns cost the reset and restoration round trips (three commands with default
 settings; additional commands for configured charset, session parameters, or
 `maxAllowedPacket=0`). No option disables this cleanup.
 
-The DSN format, `Config`, and the rest of the API are upstream's.
+Unless noted above, the DSN format and API follow upstream.
 
 ## Linking both drivers
 
@@ -135,31 +142,17 @@ git merge upstream/master
 
 Edits to upstream files include: the module path and
 driver name (`go.mod`, `driver.go`, plus doc comments and test call sites that
-spell either one out), the CI matrix (see below), a one-line call in
+spell either one out), the CI matrix, a one-line call in
 `Config.normalize` that hands off to `rds.go`, and the read-only rejection (one
 condition in `packets.go`, the parameter in `dsn.go`, and the
 read-only-transaction flag in `connection.go`/`transaction.go`), and transaction
 cleanup hooks in connection validation, transaction completion, statement
 tracking, and connection initialization. The reset implementation lives in
-`transaction_reset.go`. The
-capabilities above live in files upstream does not have, which is what keeps
-merges near-mechanical.
+`transaction_reset.go`. Most additions live in files upstream does not have
+to reduce conflicts when merging upstream changes.
 
 Additions are cheapest when they follow the same shape: new files, or new
 methods on existing types, in preference to reworking an upstream code path.
-
-## Supported platforms
-
-Narrower than upstream, and deliberately so — CI covers **Linux with MySQL LTS
-(9.7, 8.4, 8.0)**, plus the two previous Go releases against the newest MySQL.
-
-Upstream additionally tests macOS and Windows runners and four MariaDB
-versions. Block deploys none of those, so the fork drops them: 21 matrix
-combinations become 3 (5 test jobs rather than 23, counting the two appended
-older-Go entries), and no exposure to the Windows-runner TCP dial flake that
-upstream's own CI also hits. Nothing about the driver is Linux- or
-MySQL-specific — the platforms are merely untested here, so treat upstream as
-the authority on them.
 
 ## License
 
