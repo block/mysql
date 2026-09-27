@@ -17,72 +17,97 @@ Before a canceled transaction's connection becomes available to another borrower
 The next borrower receives the locked session and gets:
 
 ```text
-next borrower inherited table locks: Error 1100 (HY000): Table 'cancel_lock_<timestamp>_other' was not locked with LOCK TABLES
+committing the transaction failed but that was expected: context canceled
+ExecContext could not update lockable_table2: Error 1100 (HY000): Table 'lockable_table2' was not locked with LOCK TABLES
+Exec could not update lockable_table2: Error 1100 (HY000): Table 'lockable_table2' was not locked with LOCK TABLES
+ExecContext can now update lockable_table2!
 ```
 
 ## Reproducer
 
-Use a disposable MySQL database with permission to create tables and acquire table locks. Save this as `cancel_test.go` in an empty directory. The test creates uniquely named tables and cleans them up, including an explicit unlock after the assertion.
+Use a disposable MySQL database with permission to create tables and acquire table locks. Save this as `main.go` in an empty directory and adjust the DSN. The program leaves two tables behind and updates any rows they contain.
+
+The commit error can be either `context canceled` or `sql: transaction has already been committed or rolled back`, depending on when automatic rollback runs.
 
 ```go
-package cancel_test
+package main
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"testing"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func TestCancelledTransactionReleasesTableLocks(t *testing.T) {
-	db, err := sql.Open("mysql", os.Getenv("MYSQL_DSN"))
+func main() {
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:3306)/test")
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	t.Cleanup(func() { db.Close() })
+	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	a := fmt.Sprintf("cancel_lock_%d", time.Now().UnixNano())
-	b := a + "_other"
-	for _, name := range []string{a, b} {
-		if _, err := db.Exec("CREATE TABLE " + name + " (id INT PRIMARY KEY)"); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			// The one-connection pool makes cleanup reach the same leaked session.
-			db.Exec("UNLOCK TABLES")
-			db.Exec("DROP TABLE " + name)
-		})
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS lockable_table1 (a int)")
+	if err != nil {
+		panic(err)
+	}
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS lockable_table2 (a int)")
+	if err != nil {
+		panic(err)
 	}
 
+	// Start a transaction that we will use to acquire a lock.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		t.Fatal(err)
+		panic(err)
 	}
-	if _, err := tx.ExecContext(ctx, "LOCK TABLES "+a+" WRITE"); err != nil {
-		t.Fatal(err)
+	if _, err := tx.ExecContext(ctx, "LOCK TABLES lockable_table1 WRITE"); err != nil {
+		panic(err)
 	}
-	cancel() // Idle transaction: no query is in flight when cancellation happens.
+	// Cancel after acquiring the lock, with no query in flight. This could
+	// happen when the caller cancels the operation or its deadline expires.
+	cancel()
 
-	nextCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-	defer stop()
-	// Wait for automatic rollback to return the only connection. Do not begin
-	// another transaction: START TRANSACTION would itself release table locks.
-	conn, err := db.Conn(nextCtx)
+	// The operation might still try to commit, unaware of the cancellation.
+	// The canceled transaction can no longer be used to release its locks.
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("committing the transaction failed but that was expected: %v\n", err)
+	}
+
+	// The next borrower inherits the table locks. With only one connection,
+	// ExecContext waits for automatic rollback before borrowing that session.
+	// A locked session cannot modify tables outside its LOCK TABLES list.
+	_, err = db.ExecContext(context.Background(), "UPDATE lockable_table2 SET a = 1234")
 	if err != nil {
-		t.Fatal(err)
+		fmt.Printf("ExecContext could not update lockable_table2: %v\n", err)
 	}
-	defer conn.Close()
-	if _, err := conn.ExecContext(nextCtx, "UPDATE "+b+" SET id = id"); err != nil {
-		t.Fatalf("next borrower inherited table locks: %v", err)
+
+	// Exec without an explicit context has the same problem.
+	_, err = db.Exec("UPDATE lockable_table2 SET a = 1234")
+	if err != nil {
+		fmt.Printf("Exec could not update lockable_table2: %v\n", err)
 	}
+
+	// Starting a fresh transaction implicitly releases the old table locks.
+	// It is START TRANSACTION, not the rollback below, that releases them.
+	tx, err = db.BeginTx(context.Background(), nil)
+	if err != nil {
+		panic(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		panic(err)
+	}
+
+	// Now the same update works.
+	_, err = db.ExecContext(context.Background(), "UPDATE lockable_table2 SET a = 1234")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("ExecContext can now update lockable_table2!")
 }
 ```
 
@@ -91,7 +116,7 @@ Run against the upstream driver, without the Block fork or a `replace` directive
 ```sh
 go mod init example.com/mysql-cancel-repro
 go get github.com/go-sql-driver/mysql@789a82a35d04f8ab5a7b28707615ef8bf9d4f09b
-MYSQL_DSN='root:password@tcp(127.0.0.1:3306)/test' go test -v -count=10 -timeout=30s
+go run main.go
 ```
 
 ## Environment and result
@@ -100,7 +125,7 @@ MYSQL_DSN='root:password@tcp(127.0.0.1:3306)/test' go test -v -count=10 -timeout
 - Go: 1.26.6.
 - MySQL: Community Server 8.0.46, InnoDB.
 - OS: macOS, arm64; local Unix socket.
-- Result: all 10 runs failed with error 1100. The TCP DSN above is an example; the verified run used a Unix-socket DSN.
+- Result: all 10 runs printed error 1100 for both plain updates, then completed the final update successfully. The TCP DSN above is an example; the verified run used a Unix-socket DSN.
 
 ## Why this appears to happen
 
@@ -108,7 +133,7 @@ MySQL documents that `ROLLBACK` does not release locks acquired by `LOCK TABLES`
 
 Go's `database/sql` automatically rolls back when the `BeginTx` context is canceled. It permits connection reuse after this rollback when the driver implements both `driver.SessionResetter` and `driver.Validator`. The driver's rollback sends `ROLLBACK`; `ResetSession` checks connection liveness, and `IsValid` checks that the connection is open and its buffer is not busy. Neither releases the remaining table locks.
 
-The reproducer deliberately uses a plain statement for the next borrower. Starting another transaction would itself release the table locks and hide the problem. It also waits by borrowing the only connection, rather than using a sleep or assuming automatic rollback has already finished.
+The reproducer first uses plain statements for the next borrower, with and without an explicit context. The one-connection pool makes these calls wait for automatic rollback without a sleep. It then starts a new transaction to demonstrate that `START TRANSACTION` implicitly releases the old table locks, making the final update succeed. That recovery does not mean `ROLLBACK` releases table locks.
 
 A detached context for cleanup on the old `sql.Tx` does not solve the problem once automatic rollback has completed: that transaction returns `sql.ErrTxDone`.
 
