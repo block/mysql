@@ -15,7 +15,7 @@ import path or driver name.
 | --- | --- | --- |
 | [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns either `driver.Rows` or `driver.Result`, matching the server response. | Raised as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793). Merged here as [#1](https://github.com/block/mysql/pull/1). |
 | [`Warnings()`](warnings.go) | Exposes the warning count from the last statement, so callers can decide whether to fetch `SHOW WARNINGS`. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
-| [Reset transaction sessions before returning to the pool](#transaction-session-cleanup) | Clears session state after commit, rollback, or cancellation, then restores configured defaults. Failed cleanup discards the connection. | [Cancellation bug report draft](BUG.md); not yet filed upstream. |
+| [Harden `sql.Tx` against unsafe reuse](#harden-sqltx-against-unsafe-reuse) | Resets session state before a transaction connection returns to the pool, guarding against missed cleanup of session-scoped resources. | Fork policy; upstream adoption is not assumed. |
 | [Auto TLS for RDS hosts](#auto-tls-for-rds-hosts) | Automatically verifies RDS and Aurora endpoints against the embedded Amazon RDS root bundle. Explicit DSN settings take precedence. | Not yet raised upstream. Merged here as [#4](https://github.com/block/mysql/pull/4). |
 | [Driver name changed to `block-mysql`](#module-path-and-driver-name) | Allows this fork and upstream's `mysql` driver to coexist without duplicate registration. | N/A |
 | [Module path changed to `github.com/block/mysql`](#module-path-and-driver-name) | Makes the fork an explicit dependency that survives across module boundaries. | N/A |
@@ -80,7 +80,126 @@ until the process restarts — with nothing in the DSN or the error to say the
 connection is the problem. See the `rejectReadOnly` parameter below for what
 happens to a DSN that still sets it.
 
-### Transaction session cleanup
+### Harden `sql.Tx` against unsafe reuse
+
+`sql.Tx` manages a transaction, not arbitrary session state. It is tempting to
+use its connection affinity for session-scoped operations such as `LOCK TABLES`.
+Those locks survive `ROLLBACK`, so application cleanup must release them before
+another borrower uses that connection. This is an application ownership trap,
+not an upstream driver bug. This fork deliberately adds a safety net; upstream
+adoption is not assumed.
+
+For example, it is easy to pass the operation's `ctx` to `UNLOCK TABLES` just as
+you did to `LOCK TABLES`. If that context has been canceled, the unlock never
+runs, and a pooled session can retain the locks. Deriving a cleanup context from
+`context.Background()` with its own timeout avoids inheriting the statement's
+cancellation, but does not keep a `sql.Tx` alive: canceling the context passed to
+`BeginTx` also triggers automatic rollback. Once that finishes, even an unlock
+with a background context returns `sql.ErrTxDone`.
+
+<details>
+<summary>Example: a canceled operation leaves table locks for the next borrower</summary>
+
+This example uses the upstream driver to show the application misuse this fork
+hardens against. Run it in a disposable database; it creates two tables and
+updates any rows they contain. With one connection in the pool, both updates
+borrow the same session after automatic rollback and report error 1100. The
+final update succeeds because starting a new transaction releases the old locks.
+
+```go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+
+	_ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:3306)/test")
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS lockable_table1 (a int)")
+	if err != nil {
+		panic(err)
+	}
+	_, err = db.Exec("CREATE TABLE IF NOT EXISTS lockable_table2 (a int)")
+	if err != nil {
+		panic(err)
+	}
+
+	// Start a transaction that we will use to acquire a lock.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		panic(err)
+	}
+	if _, err := tx.ExecContext(ctx, "LOCK TABLES lockable_table1 WRITE"); err != nil {
+		panic(err)
+	}
+	// Cancel after acquiring the lock, with no query in flight. This could
+	// happen when the caller cancels the operation or its deadline expires.
+	cancel()
+
+	// Easy mistake: reuse the operation context for session cleanup.
+	if _, err := tx.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+		fmt.Printf("UNLOCK TABLES failed: %v\n", err)
+	}
+	// context.Background() would avoid statement cancellation, but this Tx
+	// may already have been rolled back automatically and return sql.ErrTxDone.
+
+	// The operation might still try to commit, unaware of the cancellation.
+	// The canceled transaction can no longer be used to release its locks.
+	if err := tx.Commit(); err != nil {
+		fmt.Printf("committing the transaction failed but that was expected: %v\n", err)
+	}
+
+	// The next borrower inherits the table locks. With only one connection,
+	// ExecContext waits for automatic rollback before borrowing that session.
+	// A locked session cannot modify tables outside its LOCK TABLES list.
+	_, err = db.ExecContext(context.Background(), "UPDATE lockable_table2 SET a = 1234")
+	if err != nil {
+		fmt.Printf("ExecContext could not update lockable_table2: %v\n", err)
+	}
+
+	// Exec without an explicit context has the same problem.
+	_, err = db.Exec("UPDATE lockable_table2 SET a = 1234")
+	if err != nil {
+		fmt.Printf("Exec could not update lockable_table2: %v\n", err)
+	}
+
+	// Starting a fresh transaction implicitly releases the old table locks.
+	// It is START TRANSACTION, not the rollback below, that releases them.
+	tx, err = db.BeginTx(context.Background(), nil)
+	if err != nil {
+		panic(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		panic(err)
+	}
+
+	// Now the same update works.
+	_, err = db.ExecContext(context.Background(), "UPDATE lockable_table2 SET a = 1234")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("ExecContext can now update lockable_table2!")
+}
+```
+
+Applications that own session-scoped resources should reserve a `sql.Conn`,
+clean up on that same connection with a fresh timeout, and discard the physical
+connection if cleanup fails. `sql.Conn.Close()` alone returns it to the pool.
+
+</details>
 
 **Transaction sessions are reset before returning to the pool.** After a
 transaction started through `Begin` or `BeginTx`, the driver sends
