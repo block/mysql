@@ -24,6 +24,9 @@ func (tx *mysqlTx) Commit() (err error) {
 		return
 	}
 	err = tx.mc.exec("COMMIT")
+	if err != nil {
+		tx.mc.cleanup() // The transaction outcome is not safe to reuse.
+	}
 	tx.mc.inReadOnlyTx = false
 	tx.mc = nil
 	return
@@ -41,6 +44,9 @@ func (tx *mysqlTx) Rollback() (err error) {
 		return
 	}
 	err = tx.mc.exec("ROLLBACK")
+	if err != nil {
+		tx.mc.cleanup() // The transaction outcome is not safe to reuse.
+	}
 	tx.mc.inReadOnlyTx = false
 	tx.mc = nil
 	return

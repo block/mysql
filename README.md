@@ -75,6 +75,33 @@ until the process restarts — with nothing in the DSN or the error to say the
 connection is the problem. See the `rejectReadOnly` parameter below for what
 happens to a DSN that still sets it.
 
+**Transaction sessions are reset before returning to the pool.** After a
+transaction started through `Begin` or `BeginTx`, the driver sends
+`COM_RESET_CONNECTION` before the connection can sit idle in the pool. This
+releases table and advisory locks, removes temporary tables and user variables,
+and restores the configured database, charset, collation, and session parameters.
+It applies to commit, rollback, and automatic rollback after context cancellation.
+A plain `ROLLBACK` alone does not release MySQL's `LOCK TABLES` locks.
+
+Cleanup has a five-second total timeout, independent of the transaction context.
+A failed reset or failed restoration discards the connection. Cleanup failure
+does not turn an acknowledged commit into a failed commit. An error from COMMIT
+or ROLLBACK itself is preserved and its connection is discarded.
+
+A reserved `sql.Conn` keeps its session across transactions until `Conn.Close`.
+Ordinary operations without a driver-managed transaction do not trigger reset;
+SQL text such as `START TRANSACTION` is not parsed to detect transactions.
+
+Reset destroys server-side prepared statements. If prepared statements are still
+open when the connection returns, the driver discards it instead; `database/sql`
+can reprepare its cached statements on a replacement connection. Connections
+opened without a database also reconnect, because reset preserves the selected
+database and cannot undo a later `USE` back to no database. These cases cost a
+reconnect per borrowing period that contained a transaction. Other transaction
+returns cost the reset and restoration round trips (three commands with default
+settings; additional commands for configured charset, session parameters, or
+`maxAllowedPacket=0`). No option disables this cleanup.
+
 The DSN format, `Config`, and the rest of the API are upstream's.
 
 ## Linking both drivers
@@ -106,12 +133,15 @@ git fetch upstream
 git merge upstream/master
 ```
 
-Edits to upstream files are confined to four things: the module path and
+Edits to upstream files include: the module path and
 driver name (`go.mod`, `driver.go`, plus doc comments and test call sites that
 spell either one out), the CI matrix (see below), a one-line call in
 `Config.normalize` that hands off to `rds.go`, and the read-only rejection (one
 condition in `packets.go`, the parameter in `dsn.go`, and the
-read-only-transaction flag in `connection.go`/`transaction.go`). The
+read-only-transaction flag in `connection.go`/`transaction.go`), and transaction
+cleanup hooks in connection validation, transaction completion, statement
+tracking, and connection initialization. The reset implementation lives in
+`transaction_reset.go`. The
 capabilities above live in files upstream does not have, which is what keeps
 merges near-mechanical.
 

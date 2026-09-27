@@ -33,6 +33,7 @@ func (stmt *mysqlStmt) Close() error {
 		return nil
 	}
 
+	stmt.mc.openStatements--
 	err := stmt.mc.writeCommandPacketUint32(comStmtClose, stmt.id)
 	stmt.mc = nil
 	return err

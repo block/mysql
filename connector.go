@@ -11,7 +11,6 @@ package mysql
 import (
 	"context"
 	"database/sql/driver"
-	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -170,48 +169,12 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		mc.compress = true
 		mc.compIO = newCompIO(mc)
 	}
-	if mc.cfg.MaxAllowedPacket > 0 {
-		mc.maxAllowedPacket = mc.cfg.MaxAllowedPacket
-	} else {
-		// Get max allowed packet size
-		maxap, err := mc.getSystemVar("max_allowed_packet")
-		if err != nil {
-			mc.Close()
-			return nil, err
-		}
-		n, err := strconv.Atoi(maxap)
-		if err != nil {
-			mc.Close()
-			return nil, fmt.Errorf("invalid max_allowed_packet value (%q): %w", maxap, err)
-		}
-		mc.maxAllowedPacket = n - 1
-	}
-	if mc.maxAllowedPacket < maxPacketSize {
-		mc.maxWriteSize = mc.maxAllowedPacket
+	if err = mc.configurePacketSize(); err != nil {
+		mc.Close()
+		return nil, err
 	}
 
-	// Charset: character_set_connection, character_set_client, character_set_results
-	if len(mc.cfg.charsets) > 0 {
-		for _, cs := range mc.cfg.charsets {
-			// ignore errors here - a charset may not exist
-			if mc.cfg.Collation != "" {
-				err = mc.exec("SET NAMES " + cs + " COLLATE " + mc.cfg.Collation)
-			} else {
-				err = mc.exec("SET NAMES " + cs)
-			}
-			if err == nil {
-				break
-			}
-		}
-		if err != nil {
-			mc.Close()
-			return nil, err
-		}
-	}
-
-	// Handle DSN Params
-	err = mc.handleParams()
-	if err != nil {
+	if err = mc.initializeSession(); err != nil {
 		mc.Close()
 		return nil, err
 	}

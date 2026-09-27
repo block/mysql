@@ -48,6 +48,10 @@ type mysqlConn struct {
 	// turn it into ErrBadConn. See packets.go.
 	inReadOnlyTx bool
 
+	// Fork: transaction sessions must be cleaned before returning to the pool.
+	needsTransactionReset bool
+	openStatements        int
+
 	// for context support (Go 1.8+)
 	watching bool
 	watcher  chan<- context.Context
@@ -161,6 +165,7 @@ func (mc *mysqlConn) Begin() (driver.Tx, error) {
 }
 
 func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
+	mc.needsTransactionReset = true
 	if mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
@@ -264,6 +269,9 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 		}
 	}
 
+	if err == nil {
+		mc.openStatements++
+	}
 	return stmt, err
 }
 
@@ -841,7 +849,10 @@ func (mc *mysqlConn) ResetSession(ctx context.Context) error {
 // IsValid implements driver.Validator interface
 // (From Go 1.15)
 func (mc *mysqlConn) IsValid() bool {
-	return !mc.closed.Load() && !mc.buf.busy()
+	if mc.closed.Load() || mc.buf.busy() {
+		return false
+	}
+	return mc.validateTransactionSession()
 }
 
 var _ driver.SessionResetter = &mysqlConn{}
