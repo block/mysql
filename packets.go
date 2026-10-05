@@ -208,7 +208,12 @@ func (mc *mysqlConn) readHandshakePacket() (data []byte, capabilities capability
 	if end < 0 {
 		return nil, 0, 0, "", ErrMalformPkt
 	}
-	pos := 1 + end + 1 + 4
+	pos := 1 + end + 1
+	if len(data) < pos+4 {
+		return nil, 0, 0, "", ErrMalformPkt
+	}
+	mc.connectionID = binary.LittleEndian.Uint32(data[pos : pos+4])
+	pos += 4
 
 	// first part of the password cipher [8 bytes],
 	// filler [1 byte] and capability flags (lower 2 bytes) [2 bytes]
