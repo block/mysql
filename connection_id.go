@@ -13,15 +13,24 @@ package mysql
 // connection and the ID that KILL and KILL QUERY take.
 //
 // It exists so a caller can interrupt a statement without closing the
-// connection. When a context ends mid-statement the driver closes the socket,
-// but the server does not notice a closed socket while it executes: the
-// statement keeps running, holding its locks, until it finishes on its own. A
-// KILL QUERY sent on another connection ends it with error 1317 and leaves
-// this connection usable. Without the handshake value, learning the ID costs a
+// connection. When the context of a running statement ends, the driver closes
+// the connection: it is marked bad, its socket is closed, and it cannot be
+// used again. The server does not notice a closed socket while it executes,
+// so the statement keeps running, holding its locks, until it finishes on its
+// own. A caller that wants the statement to end and the connection to stay
+// usable must therefore run the statement on a context that does not end, and
+// interrupt it out of band: KILL QUERY sent on another connection ends it
+// with error 1317 and leaves this connection, and a transaction open on it,
+// usable. Without the handshake value, learning the ID costs a
 // SELECT CONNECTION_ID() round trip.
 //
-// The handshake field is 4 bytes wide. MySQL thread IDs fit; a server whose
-// thread IDs exceed 32 bits reports a truncated value here.
+// The handshake field is 4 bytes wide, so a server whose thread IDs exceed 32
+// bits reports only their low 32 bits here. MySQL's thread IDs are 32 bits
+// wide, so the value is exact against MySQL. Against a server that can issue
+// wider IDs, the truncated value may name a different connection: it must not
+// be passed to KILL, which would then interrupt or end someone else's
+// session. Compare it with SELECT CONNECTION_ID() first if the server is not
+// known to use 32-bit IDs.
 //
 // Reach it through (*sql.Conn).Raw and an interface assertion:
 //

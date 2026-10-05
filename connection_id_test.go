@@ -60,7 +60,9 @@ func TestConnectionIDMatchesServer(t *testing.T) {
 		}); err != nil {
 			dbt.Fatalf("Raw: %v", err)
 		}
-		if uint64(fromHandshake) != fromServer {
+		// The handshake field is 4 bytes wide, so a server whose thread IDs
+		// exceed 32 bits reports the low 32 bits.
+		if fromHandshake != uint32(fromServer) {
 			dbt.Errorf("ConnectionID: handshake reported %d, CONNECTION_ID() returned %d", fromHandshake, fromServer)
 		}
 	})
