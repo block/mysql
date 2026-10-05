@@ -203,7 +203,9 @@ func (mc *mysqlConn) readHandshakePacket() (data []byte, capabilities capability
 
 	// server version [null terminated string]
 	// connection id [4 bytes]
-	pos := 1 + bytes.IndexByte(data[1:], 0x00) + 1 + 4
+	pos := 1 + bytes.IndexByte(data[1:], 0x00) + 1
+	mc.connectionID = binary.LittleEndian.Uint32(data[pos : pos+4])
+	pos += 4
 
 	// first part of the password cipher [8 bytes]
 	authData := data[pos : pos+8]

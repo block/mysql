@@ -15,6 +15,7 @@ import path or driver name.
 | --- | --- | --- |
 | [`QueryResultContext`](unified.go) | Executes arbitrary SQL and returns either `driver.Rows` or `driver.Result`, matching the server response. | Raised as [go-sql-driver/mysql#1793](https://github.com/go-sql-driver/mysql/issues/1793). Merged here as [#1](https://github.com/block/mysql/pull/1). |
 | [`Warnings()`](warnings.go) | Exposes the warning count from the last statement, so callers can decide whether to fetch `SHOW WARNINGS`. | Not yet raised upstream. Merged here as [#2](https://github.com/block/mysql/pull/2). |
+| [`ConnectionID()`](connection_id.go) | Exposes the server thread ID from the handshake, so a caller can interrupt a running statement with `KILL QUERY` from another connection without first running `SELECT CONNECTION_ID()`. | Not yet raised upstream. |
 | [Auto TLS for RDS hosts](#auto-tls-for-rds-hosts) | Automatically verifies RDS and Aurora endpoints against the embedded Amazon RDS root bundle. Explicit DSN settings take precedence. | Not yet raised upstream. Merged here as [#4](https://github.com/block/mysql/pull/4). |
 | [Driver name changed to `block-mysql`](#module-path-and-driver-name) | Allows this fork and upstream's `mysql` driver to coexist without duplicate registration. | N/A |
 | [Module path changed to `github.com/block/mysql`](#module-path-and-driver-name) | Makes the fork an explicit dependency that survives across module boundaries. | N/A |
