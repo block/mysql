@@ -10,7 +10,6 @@ package mysql
 
 import (
 	"bytes"
-	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
 	"encoding/json"
@@ -20,6 +19,8 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	"github.com/block/mysql/internal/compression"
 )
 
 // MySQL client/server protocol documentations.
@@ -218,13 +219,6 @@ func (mc *mysqlConn) readHandshakePacket() (data []byte, capabilities capability
 	if capabilities&clientProtocol41 == 0 {
 		return nil, capabilities, 0, "", ErrOldProtocol
 	}
-	if capabilities&clientSSL == 0 && mc.cfg.TLS != nil {
-		if mc.cfg.AllowFallbackToPlaintext {
-			mc.cfg.TLS = nil
-		} else {
-			return nil, capabilities, 0, "", ErrNoTLS
-		}
-	}
 	pos += 2
 
 	if len(data) > pos {
@@ -297,7 +291,12 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 		clientCapabilities |= clientFoundRows
 	}
 	if mc.cfg.compress {
-		clientCapabilities |= clientCompress
+		if compression.Zstd != nil && serverCapabilities&clientZstdCompression != 0 {
+			// MySQL prefers zlib if both flags are set, so advertise only zstd.
+			clientCapabilities |= clientZstdCompression
+		} else {
+			clientCapabilities |= clientCompress
+		}
 	}
 	// To enable TLS / SSL
 	if mc.cfg.TLS != nil {
@@ -318,9 +317,9 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 	mc.extCapabilities = clientCacheMetadata & serverExtCapabilities
 }
 
-// Client Authentication Packet
-// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
-func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string) error {
+// handshakeResponseHeader builds the common header for SSLRequest and
+// HandshakeResponse. The returned buffer is valid until the next buffer use.
+func (mc *mysqlConn) handshakeResponseHeader() ([]byte, error) {
 	// packet header  4
 	// capabilities   4
 	// maxPacketSize  4
@@ -329,7 +328,7 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 	data, err := mc.buf.takeSmallBuffer(4*3 + 24)
 	if err != nil {
 		mc.cleanup()
-		return err
+		return nil, err
 	}
 	_ = data[4*3+23] // boundery check
 
@@ -347,7 +346,7 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 			data[12] = colID
 		} else if len(mc.cfg.charsets) > 0 {
 			// When cfg.charset is set, the collation is set by `SET NAMES <charset> COLLATE <collation>`.
-			return fmt.Errorf("unknown collation: %q", cname)
+			return nil, fmt.Errorf("unknown collation: %q", cname)
 		}
 	}
 
@@ -366,24 +365,24 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 		}
 	}
 
-	// SSL Connection Request Packet
-	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html
-	// https://mariadb.com/kb/en/connection/#sslrequest-packet
-	if mc.cfg.TLS != nil {
-		// Send TLS / SSL request packet
-		if err := mc.writePacket(data); err != nil {
-			return err
-		}
+	return data, nil
+}
 
-		// Switch to TLS
-		tlsConn := tls.Client(mc.netConn, mc.cfg.TLS)
-		if err := tlsConn.Handshake(); err != nil {
-			if cerr := mc.canceled.Value(); cerr != nil {
-				return cerr
-			}
-			return err
-		}
-		mc.netConn = tlsConn
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_ssl_request.html
+func (mc *mysqlConn) writeSSLRequestPacket() error {
+	data, err := mc.handshakeResponseHeader()
+	if err != nil {
+		return err
+	}
+	return mc.writePacket(data)
+}
+
+// Client Authentication Packet, sent after any TLS handshake has completed.
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_response.html
+func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string) error {
+	data, err := mc.handshakeResponseHeader()
+	if err != nil {
+		return err
 	}
 
 	// User [null terminated string]
@@ -412,6 +411,11 @@ func (mc *mysqlConn) writeHandshakeResponsePacket(authResp []byte, plugin string
 		data = append(data, mc.cfg.encodedAttributes...)
 	}
 
+	if mc.capabilities&clientZstdCompression != 0 {
+		// The level follows the attributes in HandshakeResponse only;
+		// SSLRequest must remain the fixed 32-byte header.
+		data = append(data, compression.ZstdLevel)
+	}
 	// Send Auth packet
 	return mc.writePacket(data)
 }
@@ -498,44 +502,6 @@ func (mc *mysqlConn) writeCommandPacketUint32(command byte, arg uint32) error {
 /******************************************************************************
 *                              Result Packets                                 *
 ******************************************************************************/
-
-func (mc *mysqlConn) readAuthResult() ([]byte, string, error) {
-	data, err := mc.readPacket()
-	if err != nil {
-		return nil, "", err
-	}
-
-	// packet indicator
-	switch data[0] {
-
-	case iOK:
-		// resultUnchanged, since auth happens before any queries or
-		// commands have been executed.
-		return nil, "", mc.resultUnchanged().handleOkPacket(data)
-
-	case iAuthMoreData:
-		return data[1:], "", err
-
-	case iEOF:
-		if len(data) == 1 {
-			// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_old_auth_switch_request.html
-			return nil, "mysql_old_password", nil
-		}
-		pluginEndIndex := bytes.IndexByte(data, 0x00)
-		if pluginEndIndex < 0 {
-			return nil, "", ErrMalformPkt
-		}
-		plugin := string(data[1:pluginEndIndex])
-		authData := data[pluginEndIndex+1:]
-		if len(authData) > 0 && authData[len(authData)-1] == 0 {
-			authData = authData[:len(authData)-1]
-		}
-		return authData, plugin, nil
-
-	default: // Error otherwise
-		return nil, "", mc.handleErrorPacket(data)
-	}
-}
 
 // Returns error if Packet is not a 'Result OK'-Packet
 func (mc *okHandler) readResultOK() error {
@@ -842,8 +808,8 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 		// Filler [uint8]
 		pos++
 
-		// Charset [charset, collation uint8]
-		columns[i].charSet = data[pos]
+		// Charset (collation ID) [uint16]
+		columns[i].charSet = binary.LittleEndian.Uint16(data[pos : pos+2])
 		pos += 2
 
 		// Length [uint32]
@@ -872,52 +838,17 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 // Read Packets as Field Packets until EOF-Packet or an Error appears
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_row.html
 func (rows *textRows) readRow(dest []driver.Value) error {
-	mc := rows.mc
-
-	if rows.rs.done {
-		return io.EOF
-	}
-
-	data, err := mc.readPacket()
+	data, err := rows.readRowPacket(false)
 	if err != nil {
 		return err
 	}
-
-	// EOF Packet
-	// text row packets may starts with LengthEncodedString.
-	// In such case, 0xFE can mean string larger than 0xffffff.
-	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_dt_integers.html#sect_protocol_basic_dt_int_le
-	if data[0] == iEOF && len(data) <= 0xffffff {
-		mc.readResultsetTerminator(data)
-		rows.rs.done = true
-		if !rows.HasNextResultSet() {
-			rows.mc = nil
-		}
-		return io.EOF
-	}
-	if data[0] == iERR {
-		rows.mc = nil
-		return mc.handleErrorPacket(data)
-	}
-
-	// RowSet Packet
-	var (
-		n      int
-		isNull bool
-		pos    int = 0
-	)
-
 	for i := range dest {
-		// Read bytes and convert to string
 		var buf []byte
-		buf, isNull, n, err = readLengthEncodedString(data[pos:])
-		pos += n
-
+		buf, data, err = readColumnBytes(data)
 		if err != nil {
 			return err
 		}
-
-		if isNull {
+		if buf == nil {
 			dest[i] = nil
 			continue
 		}
@@ -935,8 +866,8 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 			fieldTypeDateTime,
 			fieldTypeDate,
 			fieldTypeNewDate:
-			if mc.parseTime {
-				dest[i], err = parseDateTime(buf, mc.cfg.Loc)
+			if rows.mc.parseTime {
+				dest[i], err = parseDateTime(buf, rows.mc.cfg.Loc)
 			} else {
 				dest[i] = buf
 			}
@@ -967,6 +898,9 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 		}
 	}
 
+	if len(data) != 0 {
+		return ErrMalformPkt
+	}
 	return nil
 }
 
@@ -1351,180 +1285,79 @@ func (mc *okHandler) discardResults() error {
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html#sect_protocol_binary_resultset_row
 func (rows *binaryRows) readRow(dest []driver.Value) error {
-	data, err := rows.mc.readPacket()
+	data, err := rows.readRowPacket(true)
 	if err != nil {
 		return err
 	}
-
-	// packet indicator [1 byte]
-	if data[0] != iOK {
-		// EOF/OK Packet
-		if data[0] == iEOF {
-			rows.mc.readResultsetTerminator(data)
-			rows.rs.done = true
-			if !rows.HasNextResultSet() {
-				rows.mc = nil
-			}
-			return io.EOF
-		}
-		mc := rows.mc
-		rows.mc = nil
-
-		// Error otherwise
-		return mc.handleErrorPacket(data)
+	reader, err := newBinaryRowReader(data, len(rows.rs.columns))
+	if err != nil {
+		return err
 	}
-
-	// NULL-bitmap,  [(column-count + 7 + 2) / 8 bytes]
-	pos := 1 + (len(dest)+7+2)>>3
-	nullMask := data[1:pos]
-
 	for i := range dest {
-		// Field is NULL
-		// (byte >> bit-pos) % 2 == 1
-		if ((nullMask[(i+2)>>3] >> uint((i+2)&7)) & 1) == 1 {
+		col := &rows.rs.columns[i]
+		if reader.isNull(i, col.fieldType) {
 			dest[i] = nil
 			continue
 		}
-
-		// Convert to byte-coded string
-		switch rows.rs.columns[i].fieldType {
-		case fieldTypeNULL:
-			dest[i] = nil
-			continue
-
-		// Numeric Types
-		case fieldTypeTiny:
-			if rows.rs.columns[i].flags&flagUnsigned != 0 {
-				dest[i] = int64(data[pos])
-			} else {
-				dest[i] = int64(int8(data[pos]))
-			}
-			pos++
-			continue
-
-		case fieldTypeShort, fieldTypeYear:
-			if rows.rs.columns[i].flags&flagUnsigned != 0 {
-				dest[i] = int64(binary.LittleEndian.Uint16(data[pos : pos+2]))
-			} else {
-				dest[i] = int64(int16(binary.LittleEndian.Uint16(data[pos : pos+2])))
-			}
-			pos += 2
-			continue
-
-		case fieldTypeInt24, fieldTypeLong:
-			if rows.rs.columns[i].flags&flagUnsigned != 0 {
-				dest[i] = int64(binary.LittleEndian.Uint32(data[pos : pos+4]))
-			} else {
-				dest[i] = int64(int32(binary.LittleEndian.Uint32(data[pos : pos+4])))
-			}
-			pos += 4
-			continue
-
-		case fieldTypeLongLong:
-			if rows.rs.columns[i].flags&flagUnsigned != 0 {
-				val := binary.LittleEndian.Uint64(data[pos : pos+8])
-				if val > math.MaxInt64 {
-					dest[i] = uint64ToString(val)
-				} else {
-					dest[i] = int64(val)
-				}
-			} else {
-				dest[i] = int64(binary.LittleEndian.Uint64(data[pos : pos+8]))
-			}
-			pos += 8
-			continue
-
-		case fieldTypeFloat:
-			dest[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[pos : pos+4]))
-			pos += 4
-			continue
-
-		case fieldTypeDouble:
-			dest[i] = math.Float64frombits(binary.LittleEndian.Uint64(data[pos : pos+8]))
-			pos += 8
-			continue
-
-		// Length coded Binary Strings
-		case fieldTypeDecimal, fieldTypeNewDecimal, fieldTypeVarChar,
-			fieldTypeBit, fieldTypeEnum, fieldTypeSet, fieldTypeTinyBLOB,
-			fieldTypeMediumBLOB, fieldTypeLongBLOB, fieldTypeBLOB,
-			fieldTypeVarString, fieldTypeString, fieldTypeGeometry, fieldTypeJSON,
-			fieldTypeVector:
-			var isNull bool
-			var n int
-			dest[i], isNull, n, err = readLengthEncodedString(data[pos:])
-			pos += n
-			if err == nil {
-				if !isNull {
-					continue
-				} else {
-					dest[i] = nil
-					continue
-				}
-			}
-			return err
-
-		case
-			fieldTypeDate, fieldTypeNewDate, // Date YYYY-MM-DD
-			fieldTypeTime,                         // Time [-][H]HH:MM:SS[.fractal]
-			fieldTypeTimestamp, fieldTypeDateTime: // Timestamp YYYY-MM-DD HH:MM:SS[.fractal]
-
-			num, isNull, n := readLengthEncodedInteger(data[pos:])
-			pos += n
-
-			switch {
-			case isNull:
-				dest[i] = nil
-				continue
-			case rows.rs.columns[i].fieldType == fieldTypeTime:
-				// database/sql does not support an equivalent to TIME, return a string
-				var dstlen uint8
-				switch decimals := rows.rs.columns[i].decimals; decimals {
-				case 0x00, 0x1f:
-					dstlen = 8
-				case 1, 2, 3, 4, 5, 6:
-					dstlen = 8 + 1 + decimals
-				default:
-					return fmt.Errorf(
-						"protocol error, illegal decimals value %d",
-						rows.rs.columns[i].decimals,
-					)
-				}
-				dest[i], err = formatBinaryTime(data[pos:pos+int(num)], dstlen)
-			case rows.mc.parseTime:
-				dest[i], err = parseBinaryDateTime(num, data[pos:], rows.mc.cfg.Loc)
-			default:
-				var dstlen uint8
-				if rows.rs.columns[i].fieldType == fieldTypeDate {
-					dstlen = 10
-				} else {
-					switch decimals := rows.rs.columns[i].decimals; decimals {
-					case 0x00, 0x1f:
-						dstlen = 19
-					case 1, 2, 3, 4, 5, 6:
-						dstlen = 19 + 1 + decimals
-					default:
-						return fmt.Errorf(
-							"protocol error, illegal decimals value %d",
-							rows.rs.columns[i].decimals,
-						)
-					}
-				}
-				dest[i], err = formatBinaryDateTime(data[pos:pos+int(num)], dstlen)
-			}
-
-			if err == nil {
-				pos += int(num)
-				continue
-			} else {
+		raw, fixed := reader.readFixedColumn(col.fieldType)
+		if !fixed {
+			raw, err = reader.readVariableColumn(col.fieldType)
+			if err != nil {
 				return err
 			}
-
-		// Please report if this happens!
+		}
+		if raw == nil {
+			dest[i] = nil
+			continue
+		}
+		switch col.fieldType {
+		case fieldTypeTiny:
+			if col.flags&flagUnsigned != 0 {
+				dest[i] = int64(raw[0])
+			} else {
+				dest[i] = int64(int8(raw[0]))
+			}
+		case fieldTypeShort, fieldTypeYear:
+			n := binary.LittleEndian.Uint16(raw)
+			if col.flags&flagUnsigned != 0 {
+				dest[i] = int64(n)
+			} else {
+				dest[i] = int64(int16(n))
+			}
+		case fieldTypeInt24, fieldTypeLong:
+			n := binary.LittleEndian.Uint32(raw)
+			if col.flags&flagUnsigned != 0 {
+				dest[i] = int64(n)
+			} else {
+				dest[i] = int64(int32(n))
+			}
+		case fieldTypeLongLong:
+			n := binary.LittleEndian.Uint64(raw)
+			if col.flags&flagUnsigned != 0 && n > math.MaxInt64 {
+				dest[i] = uint64ToString(n)
+			} else {
+				dest[i] = int64(n)
+			}
+		case fieldTypeFloat:
+			dest[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw))
+		case fieldTypeDouble:
+			dest[i] = math.Float64frombits(binary.LittleEndian.Uint64(raw))
+		case fieldTypeDate, fieldTypeNewDate, fieldTypeTimestamp, fieldTypeDateTime, fieldTypeTime:
+			if col.fieldType != fieldTypeTime && rows.mc.parseTime {
+				dest[i], err = parseBinaryDateTime(uint64(len(raw)), raw, rows.mc.cfg.Loc)
+			} else {
+				dest[i], err = formatBinaryColumnDateTimeValue(*col, raw)
+			}
+			if err != nil {
+				return err
+			}
 		default:
-			return fmt.Errorf("unknown field type %d", rows.rs.columns[i].fieldType)
+			// The reader rejects unknown types; the remaining types are bytes.
+			dest[i] = raw
 		}
 	}
-
+	if len(reader.data) != 0 {
+		return ErrMalformPkt
+	}
 	return nil
 }

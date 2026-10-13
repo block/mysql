@@ -166,6 +166,8 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
       * [Address](#address)
       * [Parameters](#parameters)
       * [Examples](#examples)
+    * [Verifying Server](#verifying-server)
+    * [OpenID Connect authentication](#openid-connect-authentication)
     * [Connection pool and timeouts](#connection-pool-and-timeouts)
     * [context.Context Support](#contextcontext-support)
     * [ColumnType Support](#columntype-support)
@@ -189,7 +191,7 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
   * Secure `LOAD DATA LOCAL INFILE` support with file allowlisting and `io.Reader` support
   * Optional `time.Time` parsing
   * Optional placeholder interpolation
-  * Supports zlib compression.
+  * Supports zlib compression and optional zstd compression.
 
 ## Requirements
 
@@ -427,7 +429,20 @@ Valid Values:   true, false
 Default:        false
 ```
 
-Toggles zlib compression. false by default.
+Toggles compression. false by default. Connections use zlib unless the optional
+`github.com/block/mysql/zstd` package is imported:
+
+```go
+import _ "github.com/block/mysql/zstd"
+```
+
+This import also registers the MySQL driver. With `compress=true` (or
+`EnableCompression(true)`), connections automatically prefer zstd when the server
+supports it and fall back to zlib otherwise.
+
+Applications that do not import `mysql/zstd` do not compile or link
+`github.com/klauspost/compress`. The optional package's dependency is listed in the
+module's `go.mod`.
 
 ##### `interpolateParams`
 
@@ -714,6 +729,94 @@ user:password@/
 ```
 
 
+### Verifying Server
+
+With system trust roots, use `tls=true` to verify the certificate chain and the
+server name in the connection address. When dialing an IP for a DNS-named server,
+set the expected name explicitly:
+
+```go
+cfg.TLS = &tls.Config{ServerName: "database.example"}
+```
+
+#### Private CA (VERIFY_CA)
+
+For an exclusive private CA or the intended server's self-signed certificate,
+verify the certificate chain without checking the server name:
+
+```go
+roots := x509.NewCertPool()
+if !roots.AppendCertsFromPEM(caPEM) { // Obtain the trusted certificate through a trusted channel.
+    return errors.New("no CA certificates found")
+}
+cfg.TLS = &tls.Config{
+    InsecureSkipVerify: true, // Replace default verification with VERIFY_CA below.
+    VerifyConnection: func(state tls.ConnectionState) error {
+        if len(state.PeerCertificates) == 0 {
+            return errors.New("server did not provide a certificate")
+        }
+        intermediates := x509.NewCertPool()
+        for _, cert := range state.PeerCertificates[1:] {
+            intermediates.AddCert(cert)
+        }
+        _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{
+            Roots:         roots,
+            Intermediates: intermediates,
+            KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+            // Omit DNSName for VERIFY_CA.
+        })
+        return err
+    },
+}
+```
+
+This safely authenticates the intended server without hostname verification when
+the trusted signing key is kept private and has not issued certificates to other
+users or unrelated servers. A CA shared with unrelated services does not provide
+that guarantee. `InsecureSkipVerify` plus `RootCAs` alone does **not** verify
+certificates; keep the callback and propagate its errors.
+
+Pass `cfg` to `mysql.NewConnector` and `sql.OpenDB`. For DSNs, register the TLS
+configuration with `mysql.RegisterTLSConfig` and use its name in `tls`.
+Avoid `tls=skip-verify`, `tls=preferred`, and `AllowFallbackToPlaintext` when
+server authentication is required. See Go's [`tls.Config`](https://pkg.go.dev/crypto/tls#Config).
+
+### OpenID Connect authentication
+
+Use `cfg.Apply(mysql.OIDCToken(token))` with `mysql.NewConnector` and `sql.OpenDB`.
+The token is not included in `FormatDSN`; there is no OIDC DSN parameter.
+Configure TLS to authenticate the intended server. If using `InsecureSkipVerify`,
+provide proper replacement verification; the driver does not validate your policy.
+Plaintext fallback and TLS provided solely by a custom dialer are not supported.
+
+To obtain a fresh token for each new connection:
+
+```go
+cfg := mysql.NewConfig()
+cfg.User = "oidc_user"
+cfg.Addr = "database.example:3306"
+cfg.TLS = &tls.Config{ServerName: "database.example"}
+if err := cfg.Apply(mysql.BeforeConnect(func(ctx context.Context, cfg *mysql.Config) error {
+    token, err := tokenSource(ctx) // Application-provided, safe for concurrent calls.
+    if err != nil {
+        return err
+    }
+    return cfg.Apply(mysql.OIDCToken(token))
+})); err != nil {
+    return err
+}
+connector, err := mysql.NewConnector(cfg)
+if err != nil {
+    return err
+}
+db := sql.OpenDB(connector)
+defer db.Close()
+```
+
+An empty token makes `Apply` return `ErrOpenIDConnectToken` without changing the
+configuration. Return this error from `BeforeConnect` to abort the connection.
+Token refresh affects new connections, not existing pooled sessions.
+
 ### Connection pool and timeouts
 The connection pool is managed by Go's database/sql package. For details on how to configure the size of the pool and how long connections stay in the pool see `*DB.SetMaxOpenConns`, `*DB.SetMaxIdleConns`, and `*DB.SetConnMaxLifetime` in the [database/sql documentation](https://golang.org/pkg/database/sql/). The read, write, and dial timeouts for each individual connection are configured with the DSN parameters [`readTimeout`](#readtimeout), [`writeTimeout`](#writetimeout), and [`timeout`](#timeout), respectively.
 
@@ -727,6 +830,23 @@ See [context support in the database/sql package](https://golang.org/doc/go1.8#d
 > [!IMPORTANT]
 > The `QueryContext`, `ExecContext`, etc. variants provided by `database/sql` will cause the connection to be closed if the provided context is cancelled or timed out before the result is received by the driver.
 
+
+### Authentication Plugin System
+
+The driver implements a pluggable authentication system that supports various authentication methods used by MySQL and MariaDB servers. The built-in authentication plugins include:
+
+* `mysql_native_password` - Legacy MySQL authentication and the driver's initial fallback
+* `caching_sha2_password` - Default authentication method in MySQL 8.0+
+* `mysql_clear_password` - Cleartext authentication (requires `allowCleartextPasswords=true`)
+* `mysql_old_password` - Old MySQL authentication (requires `allowOldPasswords=true`)
+* `sha256_password` - SHA256 authentication
+* `client_ed25519` - MariaDB Ed25519 authentication
+
+Custom plugins implement the two methods of `AuthPlugin`, `InitAuth` and `ContinuationAuth`, and are registered with `RegisterAuthPlugin(name, factory)`. Registration does not call the factory; the driver calls it to create an independent instance for each authentication exchange. Factories may run concurrently for different connections. All built-in plugins use the same registry: registering a built-in name replaces its factory for subsequent authentication exchanges, including the initial handshake and authentication switches. Authentication-method permissions such as `allowCleartextPasswords` still apply to that name. Built-in plugin implementations are internal to the driver.
+
+The driver passes the connection's `context.Context` for cancellation and an `AuthContext` snapshot containing the selected credentials, established transport information, and configured RSA public key. Plugins do not receive or modify the connection's `Config`; the driver checks authentication-method permissions before starting a plugin. Custom plugins that require a particular transport must check it in `InitAuth` before returning credentials.
+
+`AuthContext.TLS()` reports a completed MySQL TLS handshake, not merely a TLS configuration or an external tunnel. A continuation returning `nil, nil` waits for another server packet without sending; a non-nil empty slice sends an empty packet. Authentication succeeds only when the driver receives the server's OK packet.
 
 ### `LOAD DATA LOCAL INFILE` support
 For this feature you need direct access to the package. Therefore you must change the import path (no `_`):

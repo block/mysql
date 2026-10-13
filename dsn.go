@@ -76,11 +76,12 @@ type Config struct {
 	// unexported fields. new options should be come here.
 	// boolean first. alphabetical order.
 
-	compress       bool // Enable zlib compression
+	compress       bool // Enable compression
 	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
 
 	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
 	encodedAttributes string                               // Encoded connection attributes
+	openIDToken       string                               // OpenID Connect token; never included in the DSN
 	paramOrder        []string                             // Order of connection parameters parsed from the DSN
 	pubKey            *rsa.PublicKey                       // Server public key
 	timeTruncate      time.Duration                        // Truncate time.Time values to the specified duration
@@ -145,6 +146,21 @@ func TimeTruncate(d time.Duration) Option {
 	}
 }
 
+// OIDCToken sets the JWT for OpenID Connect authentication.
+// Empty tokens return ErrOpenIDConnectToken without changing the configuration.
+// Use [BeforeConnect] to refresh the token with cfg.Apply(OIDCToken(token)).
+// The token is omitted from [Config.FormatDSN]. OIDC requires driver-managed TLS
+// with application-configured server verification and rejects authentication switches.
+func OIDCToken(token string) Option {
+	return func(cfg *Config) error {
+		if token == "" {
+			return ErrOpenIDConnectToken
+		}
+		cfg.openIDToken = token
+		return nil
+	}
+}
+
 // BeforeConnect sets the function to be invoked before a connection is established.
 // If the function changes [Config.Addr] while [Config.TLS] is non-nil and its
 // InsecureSkipVerify field is false, it must also update ServerName to match
@@ -156,7 +172,8 @@ func BeforeConnect(fn func(context.Context, *Config) error) Option {
 	}
 }
 
-// EnableCompress sets the compression mode.
+// EnableCompression enables compression. Import mysql/zstd to prefer zstd when
+// supported by the server; otherwise connections use zlib when supported.
 func EnableCompression(yes bool) Option {
 	return func(cfg *Config) error {
 		cfg.compress = yes
