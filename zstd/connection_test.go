@@ -218,10 +218,17 @@ func TestServerCompression(t *testing.T) {
 	if dsn == "" {
 		t.Skip("set MYSQL_ZSTD_TEST_DSN to test a MySQL or MariaDB server")
 	}
-	db, err := sql.Open("mysql", dsn)
+	// Fork change: open through a connector rather than sql.Open("mysql"),
+	// since this fork registers under a different driver name.
+	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := sql.OpenDB(connector)
 	defer db.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
