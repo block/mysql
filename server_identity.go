@@ -68,25 +68,29 @@ func (mc *mysqlConn) ServerIdentity(ctx context.Context) (uuid, hostname string,
 		return "", "", err
 	}
 	values := make([]driver.Value, 2)
-	err = rows.Next(values)
-	if closeErr := rows.Close(); err == nil {
-		err = closeErr
+	identity := &serverIdentity{}
+	// The row's []byte cells alias the connection's read buffer, and Close
+	// reads the result's terminator into that buffer, so the values are
+	// copied out of the row before the rows are closed.
+	if err = rows.Next(values); err != nil {
+		err = fmt.Errorf("reading the server identity: %w", err)
+	} else if identity.uuid, err = identityString(values[0]); err != nil {
+		err = fmt.Errorf("@@server_uuid: %w", err)
+	} else if identity.hostname, err = identityString(values[1]); err != nil {
+		err = fmt.Errorf("@@hostname: %w", err)
+	}
+	if closeErr := rows.Close(); err == nil && closeErr != nil {
+		err = fmt.Errorf("reading the server identity: %w", closeErr)
 	}
 	if err != nil {
-		return "", "", fmt.Errorf("reading the server identity: %w", err)
-	}
-	identity := &serverIdentity{}
-	if identity.uuid, err = identityString(values[0]); err != nil {
-		return "", "", fmt.Errorf("@@server_uuid: %w", err)
-	}
-	if identity.hostname, err = identityString(values[1]); err != nil {
-		return "", "", fmt.Errorf("@@hostname: %w", err)
+		return "", "", err
 	}
 	mc.serverIdentity = identity
 	return identity.uuid, identity.hostname, nil
 }
 
-// identityString converts one text-protocol value of serverIdentityQuery.
+// identityString converts one text-protocol value of serverIdentityQuery to
+// a string that owns its bytes.
 func identityString(v driver.Value) (string, error) {
 	switch v := v.(type) {
 	case []byte:
