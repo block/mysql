@@ -15,10 +15,6 @@ import (
 	"testing"
 )
 
-type serverIdentifier interface {
-	ServerIdentity(context.Context) (string, string, error)
-}
-
 func TestServerIdentityMatchesServerAndIsCached(t *testing.T) {
 	runTests(t, dsn, func(dbt *DBTest) {
 		ctx := context.Background()
@@ -33,24 +29,24 @@ func TestServerIdentityMatchesServerAndIsCached(t *testing.T) {
 			dbt.Fatalf("%s: %v", serverIdentityQuery, err)
 		}
 		if err := conn.Raw(func(dc any) error {
-			uuid, hostname, err := dc.(serverIdentifier).ServerIdentity(ctx)
+			uuid, hostname, err := dc.(*mysqlConn).readServerIdentity(ctx)
 			if err != nil {
-				dbt.Fatalf("ServerIdentity: %v", err)
+				dbt.Fatalf("readServerIdentity: %v", err)
 			}
 			if uuid != wantUUID || hostname != wantHostname {
-				dbt.Errorf("ServerIdentity: got (%q, %q), want (%q, %q)", uuid, hostname, wantUUID, wantHostname)
+				dbt.Errorf("readServerIdentity: got (%q, %q), want (%q, %q)", uuid, hostname, wantUUID, wantHostname)
 			}
 
 			// The second call must not touch the connection: with a
 			// cancelled context, a query would fail before it is sent.
 			cancelled, cancel := context.WithCancel(ctx)
 			cancel()
-			uuid, hostname, err = dc.(serverIdentifier).ServerIdentity(cancelled)
+			uuid, hostname, err = dc.(*mysqlConn).readServerIdentity(cancelled)
 			if err != nil {
-				dbt.Fatalf("cached ServerIdentity: %v", err)
+				dbt.Fatalf("cached readServerIdentity: %v", err)
 			}
 			if uuid != wantUUID || hostname != wantHostname {
-				dbt.Errorf("cached ServerIdentity: got (%q, %q), want (%q, %q)", uuid, hostname, wantUUID, wantHostname)
+				dbt.Errorf("cached readServerIdentity: got (%q, %q), want (%q, %q)", uuid, hostname, wantUUID, wantHostname)
 			}
 			return nil
 		}); err != nil {
@@ -71,11 +67,11 @@ func TestServerIdentityFailureIsNotCached(t *testing.T) {
 		if err := conn.Raw(func(dc any) error {
 			cancelled, cancel := context.WithCancel(ctx)
 			cancel()
-			if _, _, err := dc.(serverIdentifier).ServerIdentity(cancelled); err == nil {
-				dbt.Fatal("ServerIdentity with a cancelled context: got nil error")
+			if _, _, err := dc.(*mysqlConn).readServerIdentity(cancelled); err == nil {
+				dbt.Fatal("readServerIdentity with a cancelled context: got nil error")
 			}
-			if _, _, err := dc.(serverIdentifier).ServerIdentity(ctx); err != nil {
-				dbt.Fatalf("ServerIdentity after a failed call: %v", err)
+			if _, _, err := dc.(*mysqlConn).readServerIdentity(ctx); err != nil {
+				dbt.Fatalf("readServerIdentity after a failed call: %v", err)
 			}
 			return nil
 		}); err != nil && err != driver.ErrBadConn {
@@ -154,12 +150,12 @@ func TestServerIdentitySurvivesSeparateTerminator(t *testing.T) {
 	conn := &packetPerReadConn{reads: [][]byte{header, packet(5, lenenc(uuid), lenenc(hostname)), eof(6)}}
 	mc.netConn = conn
 
-	gotUUID, gotHostname, err := mc.ServerIdentity(context.Background())
+	gotUUID, gotHostname, err := mc.readServerIdentity(context.Background())
 	if err != nil {
-		t.Fatalf("ServerIdentity: %v", err)
+		t.Fatalf("readServerIdentity: %v", err)
 	}
 	if gotUUID != uuid || gotHostname != hostname {
-		t.Fatalf("ServerIdentity: got (%q, %q), want (%q, %q)", gotUUID, gotHostname, uuid, hostname)
+		t.Fatalf("readServerIdentity: got (%q, %q), want (%q, %q)", gotUUID, gotHostname, uuid, hostname)
 	}
 	if len(conn.reads) != 0 {
 		t.Fatalf("%d reads left unconsumed", len(conn.reads))

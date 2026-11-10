@@ -56,47 +56,30 @@ type KillTarget struct {
 	// ThreadID is the connection's server thread ID (ConnectionID). Zero is
 	// no thread: no MySQL connection has it.
 	ThreadID uint32
-	// ServerUUID and Hostname identify the server (ServerIdentity).
+	// ServerUUID and Hostname identify the server: its @@server_uuid and
+	// @@hostname.
 	ServerUUID string
 	Hostname   string
 }
 
-// threadIDReporter and serverReporter are the methods ReadKillTarget needs
-// from a driver connection. A connection that wraps this driver's forwards
-// them to make itself interruptible.
-type (
-	threadIDReporter interface {
-		ConnectionID() uint32
-	}
-	serverReporter interface {
-		ServerIdentity(context.Context) (string, string, error)
-	}
-)
-
 // ReadKillTarget returns the KillTarget of driverConn, the driver connection
-// (*sql.Conn).Raw hands its callback: this driver's, or one that forwards
-// ConnectionID and ServerIdentity to it.
+// (*sql.Conn).Raw hands its callback. Only this driver's own connections can
+// be read: the error wraps ErrKillQueryUnsupported for any other, including
+// one that wraps this driver's.
 //
 // Call it before starting the statement the target is for, never while a
-// statement runs on the connection: the first ServerIdentity call on a
-// connection is a statement. Later calls are free.
-//
-// The error wraps ErrKillQueryUnsupported when the connection cannot name its
-// thread, and is ServerIdentity's error otherwise.
+// statement runs on the connection: the first call on a connection reads its
+// @@server_uuid and @@hostname with a statement. Later calls are free.
 func ReadKillTarget(ctx context.Context, driverConn any) (KillTarget, error) {
-	ider, ok := driverConn.(threadIDReporter)
+	mc, ok := driverConn.(*mysqlConn)
 	if !ok {
-		return KillTarget{}, fmt.Errorf("%w: %T does not report its thread ID", ErrKillQueryUnsupported, driverConn)
+		return KillTarget{}, fmt.Errorf("%w: %T is not a connection of this driver", ErrKillQueryUnsupported, driverConn)
 	}
-	identifier, ok := driverConn.(serverReporter)
-	if !ok {
-		return KillTarget{}, fmt.Errorf("%w: %T does not report its server", ErrKillQueryUnsupported, driverConn)
-	}
-	threadID := ider.ConnectionID()
+	threadID := mc.ConnectionID()
 	if threadID == 0 {
-		return KillTarget{}, fmt.Errorf("%w: %T reports no thread ID", ErrKillQueryUnsupported, driverConn)
+		return KillTarget{}, fmt.Errorf("%w: the connection reports no thread ID", ErrKillQueryUnsupported)
 	}
-	uuid, hostname, err := identifier.ServerIdentity(ctx)
+	uuid, hostname, err := mc.readServerIdentity(ctx)
 	if err != nil {
 		return KillTarget{}, err
 	}
@@ -125,7 +108,8 @@ type QueryKiller interface {
 // connections across replicas, and a writer endpoint moves on failover. A
 // KILL QUERY sent to another server ends an unrelated session that happens to
 // have the same thread ID there. So KillQuery sends KILL QUERY only on an
-// interrupt connection whose ServerIdentity matches the target's, dialing
+// interrupt connection whose @@server_uuid and @@hostname match the
+// target's, dialing
 // again (up to three times) when it does not. Behind a proxy that reports the
 // variables of a server other than the one numbering its connections (a
 // Vitess vtgate), the comparison proves nothing: do not interrupt statements
@@ -151,9 +135,9 @@ type Interrupter struct {
 // NewInterrupter returns an Interrupter that dials its connections with
 // connector. Nothing is dialed until the first KillQuery.
 //
-// Its connections must be able to report ServerIdentity, so connector is
-// this driver's (NewConnector), or one whose connections forward that method
-// to it. Pass a connector that reaches the same servers with the same user
+// connector must return this driver's own connections: NewConnector's, or a
+// wrapping connector whose Connect returns them unchanged. KillQuery refuses
+// any other connection with ErrKillQueryUnsupported. Pass a connector that reaches the same servers with the same user
 // as the statements to interrupt: a user may kill its own threads without
 // any privilege. Pass one that does not shed or queue load either, since an
 // interrupt relieves an overloaded server.
@@ -217,11 +201,11 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 		// A callback error that wraps driver.ErrBadConn makes database/sql
 		// close the driver connection, and conn with it.
 		err = conn.Raw(func(driverConn any) error {
-			identifier, ok := driverConn.(serverReporter)
+			mc, ok := driverConn.(*mysqlConn)
 			if !ok {
-				return fmt.Errorf("%w: interrupt connection %T does not report its server: %w", ErrKillQueryUnsupported, driverConn, driver.ErrBadConn)
+				return fmt.Errorf("%w: interrupt connection %T is not a connection of this driver: %w", ErrKillQueryUnsupported, driverConn, driver.ErrBadConn)
 			}
-			uuid, hostname, err := identifier.ServerIdentity(ctx)
+			uuid, hostname, err := mc.readServerIdentity(ctx)
 			if err != nil {
 				return fmt.Errorf("reading the interrupt connection's server identity: %w: %w", err, driver.ErrBadConn)
 			}
@@ -230,11 +214,7 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 				// connection never will.
 				return fmt.Errorf("%w: %w", ErrKillQueryWrongServer, driver.ErrBadConn)
 			}
-			execer, ok := driverConn.(driver.ExecerContext)
-			if !ok {
-				return fmt.Errorf("%w: interrupt connection %T cannot execute statements: %w", ErrKillQueryUnsupported, driverConn, driver.ErrBadConn)
-			}
-			_, err = execer.ExecContext(ctx, kill, nil)
+			_, err = mc.ExecContext(ctx, kill, nil)
 			return err
 		})
 		if !errors.Is(err, driver.ErrBadConn) {

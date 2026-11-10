@@ -91,6 +91,28 @@ func TestArmedStatementFinishRightAfterCancelReportsInterrupted(t *testing.T) {
 	}
 }
 
+// valuelessContext hides its parent's values, so context.AfterFunc cannot
+// find the cancelCtx underneath and watches it from a goroutine instead.
+type valuelessContext struct{ context.Context }
+
+func (valuelessContext) Value(any) any { return nil }
+
+// TestArmedStatementFinishAfterAWrappedContextEndsReportsInterrupted: with a
+// context AfterFunc watches from a goroutine, the interrupt can still be
+// deregistered after the context has ended.
+func TestArmedStatementFinishAfterAWrappedContextEndsReportsInterrupted(t *testing.T) {
+	for range 100 {
+		parent, cancel := context.WithCancel(context.Background())
+		killer := newFakeKiller(nil)
+		_, armed := ArmInterrupt(valuelessContext{parent}, killer, testKillTarget, InterruptOptions{})
+		cancel()
+		outcome := armed.Finish()
+		if !outcome.Interrupted || outcome.Unacknowledged || outcome.FellBack {
+			t.Fatalf("Finish: got %+v, want only Interrupted", outcome)
+		}
+	}
+}
+
 func TestArmedStatementThatFinishesIsNeverInterrupted(t *testing.T) {
 	type key struct{}
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), key{}, "value"))

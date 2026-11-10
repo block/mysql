@@ -70,6 +70,8 @@ type InterruptOutcome struct {
 // every statement: one allocation beyond the contexts, and no channel until
 // an interrupt starts.
 type ArmedStatement struct {
+	// caller is the context ArmInterrupt was given.
+	caller  context.Context
 	killer  QueryKiller
 	target  KillTarget
 	options InterruptOptions
@@ -146,7 +148,7 @@ func ArmInterrupt(ctx context.Context, killer QueryKiller, target KillTarget, op
 	if options.RetryInterval <= 0 {
 		options.RetryInterval = DefaultInterruptRetryInterval
 	}
-	a := &ArmedStatement{killer: killer, target: target, options: options}
+	a := &ArmedStatement{caller: ctx, killer: killer, target: target, options: options}
 	var runCtx context.Context
 	runCtx, a.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	a.running.Add(1)
@@ -164,8 +166,11 @@ func (a *ArmedStatement) Finish() InterruptOutcome {
 	}
 	var outcome InterruptOutcome
 	if a.stop() {
-		// The interrupt will never run.
+		// The interrupt will never run. A context that context.AfterFunc
+		// can only watch from a goroutine of its own (one whose Value hides
+		// the cancelCtx underneath) may have ended already all the same.
 		a.running.Done()
+		outcome.Interrupted = a.caller.Err() != nil
 	} else {
 		// ctx ended before Finish. The interrupt may not have taken mu
 		// yet, and once finished is set it sends no KILL QUERY, but the

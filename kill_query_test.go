@@ -132,9 +132,9 @@ func TestReadKillTargetNamesTheConnection(t *testing.T) {
 
 func TestReadKillTargetRefusesAConnectionThatCannotNameItsThread(t *testing.T) {
 	for name, driverConn := range map[string]any{
-		"no ConnectionID":   struct{}{},
-		"no ServerIdentity": threadOnlyConn{id: 5},
-		"no thread":         threadAndServerConn{},
+		"another driver's connection": struct{}{},
+		"a wrapping connection":       wrappedConn{Conn: &mysqlConn{connectionID: 5}},
+		"no thread":                   &mysqlConn{},
 	} {
 		if _, err := ReadKillTarget(context.Background(), driverConn); !errors.Is(err, ErrKillQueryUnsupported) {
 			t.Errorf("%s: got %v, want ErrKillQueryUnsupported", name, err)
@@ -142,14 +142,34 @@ func TestReadKillTargetRefusesAConnectionThatCannotNameItsThread(t *testing.T) {
 	}
 }
 
-type threadOnlyConn struct{ id uint32 }
+// wrappedConn is a connection that wraps this driver's, as an
+// instrumentation wrapper would.
+type wrappedConn struct{ driver.Conn }
 
-func (c threadOnlyConn) ConnectionID() uint32 { return c.id }
+// wrappingConnector returns its connector's connections wrapped.
+type wrappingConnector struct{ driver.Connector }
 
-type threadAndServerConn struct{ threadOnlyConn }
+func (c wrappingConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return wrappedConn{Conn: conn}, nil
+}
 
-func (threadAndServerConn) ServerIdentity(context.Context) (string, string, error) {
-	return "uuid", "host", nil
+// TestInterrupterRefusesAWrappingConnector: the server check needs this
+// driver's own connection, so an Interrupter whose connector wraps its
+// connections sends nothing.
+func TestInterrupterRefusesAWrappingConnector(t *testing.T) {
+	if !available {
+		t.Skipf("MySQL server not running on %s", netAddr)
+	}
+	interrupter := NewInterrupter(wrappingConnector{newCountingConnector(t)})
+	defer interrupter.Close()
+	err := interrupter.KillQuery(t.Context(), testKillTarget)
+	if !errors.Is(err, ErrKillQueryUnsupported) {
+		t.Fatalf("KillQuery: got %v, want ErrKillQueryUnsupported", err)
+	}
 }
 
 // TestInterrupterKillsAStatementWhileItsPoolIsFull verifies that KILL QUERY
