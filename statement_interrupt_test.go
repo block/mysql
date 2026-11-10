@@ -11,6 +11,7 @@ package mysql
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -216,6 +217,68 @@ func TestArmedStatementThatOutlivesKillQueryFallsBack(t *testing.T) {
 	}
 	if n := killer.calls.Load(); n < 2 {
 		t.Errorf("KillQuery called %d times, want it resent while the statement ran", n)
+	}
+}
+
+// TestArmedStatementWhoseKillQueryWasNotSentKeepsTheConnection: a KILL
+// QUERY that was never sent cannot reach the connection later, so falling
+// back leaves nothing unacknowledged.
+func TestArmedStatementWhoseKillQueryWasNotSentKeepsTheConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	killer := newFakeKiller(fmt.Errorf("%w: %w", ErrKillQueryNotSent, ErrKillQueryWrongServer))
+	runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
+	cancel()
+	select {
+	case <-runCtx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the statement's context must be cancelled when KILL QUERY cannot be sent")
+	}
+	outcome := armed.Finish()
+	if !outcome.Interrupted || outcome.Unacknowledged || !outcome.FellBack {
+		t.Errorf("Finish: got %+v, want Interrupted and FellBack", outcome)
+	}
+}
+
+// killerFunc is a QueryKiller made of a function.
+type killerFunc func(context.Context, KillTarget) error
+
+func (f killerFunc) KillQuery(ctx context.Context, target KillTarget) error { return f(ctx, target) }
+
+// TestArmedStatementPastItsDeadlineSendsNoMoreKills: when the retry and the
+// deadline are both due, the interrupt must fall back as having outlived its
+// KILL QUERY, not send another one on the expired context and report that
+// failure as unacknowledged.
+func TestArmedStatementPastItsDeadlineSendsNoMoreKills(t *testing.T) {
+	const timeout = 20 * time.Millisecond
+	for range 50 {
+		var calls atomic.Int32
+		killer := killerFunc(func(ctx context.Context, _ KillTarget) error {
+			if calls.Add(1) == 1 {
+				// Acknowledged, but only once the deadline has passed.
+				time.Sleep(timeout + 10*time.Millisecond)
+				return nil
+			}
+			return ctx.Err()
+		})
+		var fallbackErr error
+		ctx, cancel := context.WithCancel(context.Background())
+		runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{
+			Timeout:       timeout,
+			RetryInterval: time.Nanosecond,
+			OnFallback:    func(_ KillTarget, err error) { fallbackErr = err },
+		})
+		cancel()
+		<-runCtx.Done()
+		outcome := armed.Finish()
+		if outcome.Unacknowledged || !outcome.FellBack {
+			t.Fatalf("Finish: got %+v, want FellBack only", outcome)
+		}
+		if !errors.Is(fallbackErr, ErrStatementOutlivedKill) {
+			t.Fatalf("OnFallback: got %v, want ErrStatementOutlivedKill", fallbackErr)
+		}
+		if n := calls.Load(); n != 1 {
+			t.Fatalf("KillQuery called %d times, want 1", n)
+		}
 	}
 }
 

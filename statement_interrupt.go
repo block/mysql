@@ -213,8 +213,9 @@ func (a *ArmedStatement) interrupt() {
 // running, until finished is closed. When KILL QUERY fails, or the statement
 // outlives the timeout, it cancels the statement's context instead.
 //
-// It reports whether every KILL QUERY it sent was acknowledged, and whether
-// it fell back. A KILL QUERY that failed may still have been sent (the usual
+// It reports whether every KILL QUERY it sent was acknowledged (one that
+// was never sent, ErrKillQueryNotSent, counts as settled), and whether it
+// fell back. A KILL QUERY that failed may still have been sent (the usual
 // failure is its context expiring mid-round trip, on the slow server that
 // made the statement time out), and the server may yet run it. By then the
 // statement may have finished on its own, so cancelling closed nothing, and
@@ -230,9 +231,20 @@ func (a *ArmedStatement) kill(finished <-chan struct{}) (acknowledged, fellBack 
 			return true, false
 		default:
 		}
+		// Checked before every send, not only in the wait below: when the
+		// retry and the deadline are both due, a resend would fail on the
+		// expired context and misreport an acknowledged interrupt.
+		select {
+		case <-deadline.C:
+			a.fallBack(ErrStatementOutlivedKill)
+			return true, true
+		default:
+		}
 		if err := a.killer.KillQuery(killCtx, a.target); err != nil {
 			a.fallBack(err)
-			return false, true
+			// Nothing pending can reach the connection when the
+			// KILL QUERY was never sent.
+			return errors.Is(err, ErrKillQueryNotSent), true
 		}
 		retry := time.NewTimer(a.options.RetryInterval)
 		select {

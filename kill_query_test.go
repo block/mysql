@@ -167,8 +167,8 @@ func TestInterrupterRefusesAWrappingConnector(t *testing.T) {
 	interrupter := NewInterrupter(wrappingConnector{newCountingConnector(t)})
 	defer interrupter.Close()
 	err := interrupter.KillQuery(t.Context(), testKillTarget)
-	if !errors.Is(err, ErrKillQueryUnsupported) {
-		t.Fatalf("KillQuery: got %v, want ErrKillQueryUnsupported", err)
+	if !errors.Is(err, ErrKillQueryUnsupported) || !errors.Is(err, ErrKillQueryNotSent) {
+		t.Fatalf("KillQuery: got %v, want ErrKillQueryUnsupported and ErrKillQueryNotSent", err)
 	}
 }
 
@@ -273,8 +273,8 @@ func TestInterrupterRefusesAnotherServer(t *testing.T) {
 	target.ServerUUID = "another-server"
 
 	err = interrupter.KillQuery(t.Context(), target)
-	if !errors.Is(err, ErrKillQueryWrongServer) {
-		t.Fatalf("KillQuery: got %v, want ErrKillQueryWrongServer", err)
+	if !errors.Is(err, ErrKillQueryWrongServer) || !errors.Is(err, ErrKillQueryNotSent) {
+		t.Fatalf("KillQuery: got %v, want ErrKillQueryWrongServer and ErrKillQueryNotSent", err)
 	}
 	if n := connector.dials.Load(); n != interrupterServerAttempts {
 		t.Errorf("dialed %d interrupt connections, want %d", n, interrupterServerAttempts)
@@ -305,7 +305,7 @@ func TestInterrupterClose(t *testing.T) {
 		t.Errorf("Close closed the caller's connector %d times", n)
 	}
 	err := interrupter.KillQuery(t.Context(), testKillTarget)
-	if !errors.Is(err, ErrInterrupterClosed) {
-		t.Errorf("KillQuery after Close: got %v, want ErrInterrupterClosed", err)
+	if !errors.Is(err, ErrInterrupterClosed) || !errors.Is(err, ErrKillQueryNotSent) {
+		t.Errorf("KillQuery after Close: got %v, want ErrInterrupterClosed and ErrKillQueryNotSent", err)
 	}
 }

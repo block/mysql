@@ -36,6 +36,12 @@ const (
 )
 
 var (
+	// ErrKillQueryNotSent is wrapped by a KillQuery error when the KILL QUERY
+	// was never sent, so it cannot reach the target's connection later. A
+	// KillQuery error that does not wrap it may come after the KILL QUERY
+	// went out.
+	ErrKillQueryNotSent = errors.New("mysql: KILL QUERY was not sent")
+
 	// ErrInterrupterClosed is KillQuery's answer once the Interrupter has
 	// been closed.
 	ErrInterrupterClosed = errors.New("mysql: interrupter closed")
@@ -90,7 +96,9 @@ func ReadKillTarget(ctx context.Context, driverConn any) (KillTarget, error) {
 // implementation; the interface lets ArmInterrupt be tested with others.
 type QueryKiller interface {
 	// KillQuery sends KILL QUERY target.ThreadID to target's server. It is
-	// safe to call while the statement runs.
+	// safe to call while the statement runs. An error that wraps
+	// ErrKillQueryNotSent promises that nothing was sent; any other error
+	// is taken to mean the KILL QUERY may still reach the server.
 	KillQuery(ctx context.Context, target KillTarget) error
 }
 
@@ -180,24 +188,26 @@ func (c unclosableConnector) Driver() driver.Driver {
 // is on target's server. ctx bounds it, including the dials; KillQuery has no
 // timeout of its own.
 //
-// It returns nil once the server has acknowledged the KILL QUERY. It wraps
-// ErrKillQueryWrongServer when no interrupt connection reached target's
-// server, in which case nothing was sent. Any other error may come after the
-// KILL QUERY was sent, so the server may still act on it.
+// It returns nil once the server has acknowledged the KILL QUERY. An error
+// that wraps ErrKillQueryNotSent means nothing was sent: the Interrupter is
+// closed, no interrupt connection could be dialed or reached target's server
+// (ErrKillQueryWrongServer), or ctx ended first. Any other error may come
+// after the KILL QUERY was sent, so the server may still act on it.
 func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 	if target.ThreadID == 0 {
-		return fmt.Errorf("%w: no thread ID", ErrKillQueryUnsupported)
+		return fmt.Errorf("%w: %w: no thread ID", ErrKillQueryNotSent, ErrKillQueryUnsupported)
 	}
 	db, err := i.get()
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrKillQueryNotSent, err)
 	}
 	kill := "KILL QUERY " + strconv.FormatUint(uint64(target.ThreadID), 10)
 	for range interrupterServerAttempts {
 		conn, err := db.Conn(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: %w", ErrKillQueryNotSent, err)
 		}
+		sent := false
 		// A callback error that wraps driver.ErrBadConn makes database/sql
 		// close the driver connection, and conn with it.
 		err = conn.Raw(func(driverConn any) error {
@@ -214,18 +224,34 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 				// connection never will.
 				return fmt.Errorf("%w: %w", ErrKillQueryWrongServer, driver.ErrBadConn)
 			}
+			if err := ctx.Err(); err != nil {
+				// The driver would refuse the statement before writing it.
+				return err
+			}
+			sent = true
 			_, err = mc.ExecContext(ctx, kill, nil)
 			return err
 		})
 		if !errors.Is(err, driver.ErrBadConn) {
 			_ = conn.Close()
 		}
-		if errors.Is(err, ErrKillQueryWrongServer) {
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, ErrKillQueryWrongServer):
 			continue
+		case sent && errors.Is(err, driver.ErrBadConn):
+			// The driver reports ErrBadConn only when it wrote nothing,
+			// typically on an idle connection the server has since
+			// closed: a fresh dial may succeed.
+			continue
+		case sent:
+			return err
+		default:
+			return fmt.Errorf("%w: %w", ErrKillQueryNotSent, err)
 		}
-		return err
 	}
-	return fmt.Errorf("%w (%d attempts)", ErrKillQueryWrongServer, interrupterServerAttempts)
+	return fmt.Errorf("%w: %w (%d attempts)", ErrKillQueryNotSent, ErrKillQueryWrongServer, interrupterServerAttempts)
 }
 
 // Close closes the Interrupter's connections. KillQuery fails with
