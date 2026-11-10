@@ -13,6 +13,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 )
 
 // serverIdentityQuery reads which server a connection is on. server_uuid
@@ -20,46 +21,30 @@ import (
 // apart, since they can share a server_uuid.
 const serverIdentityQuery = "SELECT @@server_uuid, @@hostname"
 
-// serverIdentity is ServerIdentity's cached answer.
+// serverIdentity is readServerIdentity's cached answer.
 type serverIdentity struct {
 	uuid     string
 	hostname string
 }
 
-// ServerIdentity reports which server this connection is on: its
+// readServerIdentity reports which server this connection is on: its
 // @@server_uuid and @@hostname. The first call reads them with one query on
 // this connection; later calls return the cached values without a round trip,
 // since a connection never moves to another server.
 //
-// It exists for callers that act on this connection's server from another
-// connection, chiefly KILL QUERY with ConnectionID(). The second connection is
-// dialed to the same address, but not necessarily the same server: an Aurora
-// reader endpoint spreads new connections across replicas, and a writer
-// endpoint moves on failover. A thread ID means something only on the server
-// that issued it, so the caller compares this connection's identity with the
-// second connection's before sending the KILL. Behind a proxy that reports
-// variables of a server other than the one numbering its connections (a
-// Vitess vtgate), the comparison proves nothing.
+// It is what ReadKillTarget and Interrupter compare before a KILL QUERY sent
+// from another connection. The second connection is dialed to the same
+// address, but not necessarily the same server: an Aurora reader endpoint
+// spreads new connections across replicas, and a writer endpoint moves on
+// failover. A thread ID means something only on the server that issued it.
+// Behind a proxy that reports variables of a server other than the one
+// numbering its connections (a Vitess vtgate), the comparison proves nothing.
 //
 // Like every method of a connection, it must not run concurrently with other
-// use of the connection: call it before starting the statement the identity
-// is for, not while that statement runs. The first call is a statement, so it
-// resets Warnings() to zero. A server without @@server_uuid (MariaDB) fails
-// the first call, and every later one tries again.
-//
-// Reach it through (*sql.Conn).Raw and an interface assertion:
-//
-//	err := conn.Raw(func(dc any) error {
-//		c, ok := dc.(interface {
-//			ServerIdentity(context.Context) (string, string, error)
-//		})
-//		if !ok {
-//			return errors.New("driver cannot identify its server")
-//		}
-//		uuid, hostname, err = c.ServerIdentity(ctx)
-//		return err
-//	})
-func (mc *mysqlConn) ServerIdentity(ctx context.Context) (uuid, hostname string, err error) {
+// use of the connection. The first call is a statement, so it resets
+// Warnings() to zero. A server without @@server_uuid (MariaDB) fails the
+// first call, and every later one tries again.
+func (mc *mysqlConn) readServerIdentity(ctx context.Context) (uuid, hostname string, err error) {
 	if mc.serverIdentity != nil {
 		return mc.serverIdentity.uuid, mc.serverIdentity.hostname, nil
 	}
@@ -69,15 +54,24 @@ func (mc *mysqlConn) ServerIdentity(ctx context.Context) (uuid, hostname string,
 	}
 	values := make([]driver.Value, 2)
 	identity := &serverIdentity{}
-	// The row's []byte cells alias the connection's read buffer, and Close
-	// reads the result's terminator into that buffer, so the values are
-	// copied out of the row before the rows are closed.
+	// The row's []byte cells alias the connection's read buffer, and
+	// reading the result's terminator reuses that buffer, so the values are
+	// copied out of the row first. The terminator is read with Next rather
+	// than left to Close: Close stops watching ctx before it reads, so a
+	// terminator that never arrives would block it with no deadline.
 	if err = rows.Next(values); err != nil {
 		err = fmt.Errorf("reading the server identity: %w", err)
 	} else if identity.uuid, err = identityString(values[0]); err != nil {
 		err = fmt.Errorf("@@server_uuid: %w", err)
 	} else if identity.hostname, err = identityString(values[1]); err != nil {
 		err = fmt.Errorf("@@hostname: %w", err)
+	} else if err = rows.Next(values); err != io.EOF {
+		if err == nil {
+			err = errors.New("more than one row")
+		}
+		err = fmt.Errorf("reading the server identity: %w", err)
+	} else {
+		err = nil
 	}
 	if closeErr := rows.Close(); err == nil && closeErr != nil {
 		err = fmt.Errorf("reading the server identity: %w", closeErr)
