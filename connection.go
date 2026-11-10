@@ -37,7 +37,7 @@ type mysqlConn struct {
 	status           statusFlag
 	warnings         uint16          // managed by resetSequence() and the OK/EOF readers; see Warnings().
 	connectionID     uint32          // from the server's handshake; see ConnectionID().
-	serverIdentity   *serverIdentity // cached by ServerIdentity().
+	serverIdentity   *serverIdentity // cached by readServerIdentity().
 	sequence         uint8
 	compressSequence uint8
 	parseTime        bool
