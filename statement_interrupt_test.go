@@ -44,14 +44,49 @@ var testKillTarget = KillTarget{ThreadID: 42, ServerUUID: "uuid", Hostname: "hos
 func TestArmInterruptHasNothingToArm(t *testing.T) {
 	cancellable, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	cancelled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
 	killer := newFakeKiller(nil)
-	for name, armed := range map[string]*ArmedStatement{
-		"context never ends": ArmInterrupt(context.Background(), killer, testKillTarget, InterruptOptions{}),
-		"no killer":          ArmInterrupt(cancellable, nil, testKillTarget, InterruptOptions{}),
-		"no thread":          ArmInterrupt(cancellable, killer, KillTarget{ServerUUID: "uuid"}, InterruptOptions{}),
+	for name, tc := range map[string]struct {
+		ctx    context.Context
+		killer QueryKiller
+		target KillTarget
+	}{
+		"context never ends":    {context.Background(), killer, testKillTarget},
+		"no killer":             {cancellable, nil, testKillTarget},
+		"no thread":             {cancellable, killer, KillTarget{ServerUUID: "uuid"}},
+		"context already ended": {cancelled, killer, testKillTarget},
 	} {
+		runCtx, armed := ArmInterrupt(tc.ctx, tc.killer, tc.target, InterruptOptions{})
 		if armed != nil {
 			t.Errorf("%s: ArmInterrupt armed a statement", name)
+		}
+		if runCtx != tc.ctx {
+			t.Errorf("%s: the statement must run on the caller's context", name)
+		}
+		if outcome := armed.Finish(); outcome != (InterruptOutcome{}) {
+			t.Errorf("%s: Finish: got %+v, want the zero outcome", name, outcome)
+		}
+	}
+	// An already-ended context stays ended, so the driver refuses the
+	// statement before it is sent instead of racing it against a KILL QUERY.
+	if n := killer.calls.Load(); n != 0 {
+		t.Errorf("KillQuery called %d times", n)
+	}
+}
+
+// TestArmedStatementFinishRightAfterCancelReportsInterrupted: the interrupt's
+// goroutine may not have run when Finish begins, and then sends nothing, but
+// the caller's context did end first.
+func TestArmedStatementFinishRightAfterCancelReportsInterrupted(t *testing.T) {
+	for range 100 {
+		ctx, cancel := context.WithCancel(context.Background())
+		killer := newFakeKiller(nil)
+		_, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
+		cancel()
+		outcome := armed.Finish()
+		if !outcome.Interrupted || outcome.Unacknowledged || outcome.FellBack {
+			t.Fatalf("Finish: got %+v, want only Interrupted", outcome)
 		}
 	}
 }
@@ -60,18 +95,18 @@ func TestArmedStatementThatFinishesIsNeverInterrupted(t *testing.T) {
 	type key struct{}
 	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), key{}, "value"))
 	killer := newFakeKiller(nil)
-	armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
+	runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
 	if armed == nil {
 		t.Fatal("ArmInterrupt: nil")
 	}
-	if got := armed.Context().Value(key{}); got != "value" {
+	if got := runCtx.Value(key{}); got != "value" {
 		t.Errorf("Context lost the caller's values: got %v", got)
 	}
 	if outcome := armed.Finish(); outcome != (InterruptOutcome{}) {
 		t.Errorf("Finish: got %+v, want the zero outcome", outcome)
 	}
-	if armed.Context().Err() == nil {
-		t.Error("Context must end once the statement has finished")
+	if runCtx.Err() == nil {
+		t.Error("the statement's context must end once the statement has finished")
 	}
 	cancel()
 	// The interrupt was deregistered: ending the caller's context now sends
@@ -85,12 +120,12 @@ func TestArmedStatementThatFinishesIsNeverInterrupted(t *testing.T) {
 func TestArmedStatementIsInterruptedWhenTheContextEnds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	killer := newFakeKiller(nil)
-	armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
+	runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
 	cancel()
 	if got := <-killer.targets; got != testKillTarget {
 		t.Errorf("KillQuery target: got %+v, want %+v", got, testKillTarget)
 	}
-	if armed.Context().Err() != nil {
+	if runCtx.Err() != nil {
 		t.Error("an acknowledged KILL QUERY must leave the statement's context alone")
 	}
 	outcome := armed.Finish()
@@ -105,7 +140,7 @@ func TestArmedStatementFallsBackWhenKillQueryFails(t *testing.T) {
 	killer := newFakeKiller(killErr)
 	var fallbackErr error
 	fellBack := make(chan struct{})
-	armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{
+	runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{
 		OnFallback: func(target KillTarget, err error) {
 			fallbackErr = err
 			close(fellBack)
@@ -114,7 +149,7 @@ func TestArmedStatementFallsBackWhenKillQueryFails(t *testing.T) {
 	cancel()
 	<-fellBack
 	select {
-	case <-armed.Context().Done():
+	case <-runCtx.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("the statement's context must be cancelled when KILL QUERY fails")
 	}
@@ -133,7 +168,7 @@ func TestArmedStatementThatOutlivesKillQueryFallsBack(t *testing.T) {
 	var fallbackErr error
 	var once sync.Once
 	fellBack := make(chan struct{})
-	armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{
+	runCtx, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{
 		Timeout:       200 * time.Millisecond,
 		RetryInterval: 20 * time.Millisecond,
 		OnFallback: func(target KillTarget, err error) {
@@ -145,7 +180,7 @@ func TestArmedStatementThatOutlivesKillQueryFallsBack(t *testing.T) {
 	})
 	cancel()
 	select {
-	case <-armed.Context().Done():
+	case <-runCtx.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("the statement's context must be cancelled once it outlives the timeout")
 	}
@@ -169,7 +204,7 @@ func TestArmedStatementFinishWaitsForKillQuery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	killer := newFakeKiller(nil)
 	killer.block = make(chan struct{})
-	armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
+	_, armed := ArmInterrupt(ctx, killer, testKillTarget, InterruptOptions{})
 	cancel()
 	<-killer.targets
 
@@ -217,8 +252,8 @@ func TestArmInterruptEndsALockWaitAndKeepsTheConnection(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		armed := ArmInterrupt(ctx, interrupter, target, InterruptOptions{})
-		_, err = driverConn.(*mysqlConn).ExecContext(armed.Context(), lockWaitQuery, nil)
+		runCtx, armed := ArmInterrupt(ctx, interrupter, target, InterruptOptions{})
+		_, err = driverConn.(*mysqlConn).ExecContext(runCtx, lockWaitQuery, nil)
 		outcome = armed.Finish()
 		return err
 	})

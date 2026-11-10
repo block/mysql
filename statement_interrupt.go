@@ -49,8 +49,9 @@ type InterruptOptions struct {
 // InterruptOutcome is what ArmedStatement.Finish reports.
 type InterruptOutcome struct {
 	// Interrupted reports that the caller's context ended before Finish,
-	// so the interrupt ran: the statement's result is no longer only its
-	// own. What that means depends on the response; see ArmInterrupt.
+	// so the interrupt started, although it sends no KILL QUERY once Finish
+	// has begun: the statement's result may no longer be only its own. What
+	// that means depends on the response; see ArmInterrupt.
 	Interrupted bool
 	// Unacknowledged reports that a KILL QUERY failed without learning
 	// whether the server ran it. It may still arrive and end whatever runs
@@ -72,11 +73,8 @@ type ArmedStatement struct {
 	killer  QueryKiller
 	target  KillTarget
 	options InterruptOptions
-	// ctx is the context the statement runs on. It keeps the caller's
-	// values but not its cancellation.
-	ctx context.Context
-	// cancel cancels ctx: the fallback that makes the driver close the
-	// connection.
+	// cancel cancels the context the statement runs on: the fallback that
+	// makes the driver close the connection.
 	cancel context.CancelFunc
 	// stop deregisters the interrupt, reporting false when it has started.
 	stop func() bool
@@ -106,29 +104,41 @@ type ArmedStatement struct {
 // with error 1317 instead, and leaves the connection usable, along with a
 // transaction or locks held on it.
 //
-// The statement must run on the returned ArmedStatement's Context, which
-// keeps ctx's values but does not end with it. When ctx ends, the interrupt
-// sends KILL QUERY, and sends it again every RetryInterval while the
-// statement keeps running. If KILL QUERY fails, or the statement outlives
-// Timeout, the interrupt cancels Context, which makes the driver close the
-// connection: the behaviour without an interrupt.
+// The statement must run on the returned context. When a statement is armed
+// that context keeps ctx's values but does not end with it. When ctx ends,
+// the interrupt sends KILL QUERY, and sends it again every RetryInterval
+// while the statement keeps running. If KILL QUERY fails, or the statement
+// outlives Timeout, the interrupt cancels the returned context, which makes
+// the driver close the connection: the behaviour without an interrupt.
 //
 // Finish must be called once the statement's response is complete: for a
 // resultset, after the rows are closed. It waits for a running interrupt, so
 // no KILL QUERY it sent can reach the connection's next statement.
 //
-// ArmInterrupt returns nil when there is nothing to arm: ctx never ends,
-// killer is nil, or target has no thread. The statement then runs on ctx.
+// When there is nothing to arm, ArmInterrupt returns ctx itself and a nil
+// *ArmedStatement, whose Finish reports a zero InterruptOutcome. That is the
+// case when ctx never ends, killer is nil, target has no thread, or ctx has
+// already ended: the statement then runs on the ended ctx, which refuses it
+// before it is sent, so nothing reaches the server for a KILL QUERY to race.
 //
 // Reading the outcome: an OK response from an interrupted statement is
 // still the statement's result. The server acknowledged it, so a write
 // happened (in autocommit, it is committed), and the interrupt only lost the
 // race with it. A resultset from an interrupted statement is not: some
 // statements answer KILL QUERY with a result instead of an error (SELECT
-// SLEEP(n) returns 1), so the rows may be cut short.
-func ArmInterrupt(ctx context.Context, killer QueryKiller, target KillTarget, options InterruptOptions) *ArmedStatement {
-	if killer == nil || target.ThreadID == 0 || ctx.Done() == nil {
-		return nil
+// SLEEP(n) returns 1), so the rows may be cut short. Error 1317 reports that
+// the statement was interrupted, not that it changed nothing: a
+// non-transactional table keeps the rows written before the kill, and with
+// multiStatements an earlier statement in the same text may have committed.
+//
+// The fallback relies on the driver's cancellation watcher, which Rows.Close
+// disarms before it reads the rows left unread. A statement interrupted
+// while Close drains its rows ends there when a KILL QUERY lands; if every
+// KILL QUERY fails, the drain lasts until the statement ends on its own, as
+// it does without ArmInterrupt.
+func ArmInterrupt(ctx context.Context, killer QueryKiller, target KillTarget, options InterruptOptions) (context.Context, *ArmedStatement) {
+	if killer == nil || target.ThreadID == 0 || ctx.Done() == nil || ctx.Err() != nil {
+		return ctx, nil
 	}
 	if options.Timeout <= 0 {
 		options.Timeout = DefaultInterruptTimeout
@@ -137,26 +147,29 @@ func ArmInterrupt(ctx context.Context, killer QueryKiller, target KillTarget, op
 		options.RetryInterval = DefaultInterruptRetryInterval
 	}
 	a := &ArmedStatement{killer: killer, target: target, options: options}
-	a.ctx, a.cancel = context.WithCancel(context.WithoutCancel(ctx))
+	var runCtx context.Context
+	runCtx, a.cancel = context.WithCancel(context.WithoutCancel(ctx))
 	a.running.Add(1)
 	a.stop = context.AfterFunc(ctx, a.interrupt)
-	return a
-}
-
-// Context returns the context the statement must run on.
-func (a *ArmedStatement) Context() context.Context {
-	return a.ctx
+	return runCtx, a
 }
 
 // Finish marks the statement complete and reports what the interrupt did.
 // When an interrupt has started it waits for it to return. Call it exactly
-// once.
+// once. On a nil *ArmedStatement it does nothing and reports a zero
+// InterruptOutcome.
 func (a *ArmedStatement) Finish() InterruptOutcome {
+	if a == nil {
+		return InterruptOutcome{}
+	}
 	var outcome InterruptOutcome
 	if a.stop() {
 		// The interrupt will never run.
 		a.running.Done()
 	} else {
+		// ctx ended before Finish. The interrupt may not have taken mu
+		// yet, and once finished is set it sends no KILL QUERY, but the
+		// statement was still interrupted.
 		a.mu.Lock()
 		a.finished = true
 		if a.wake != nil {
@@ -167,6 +180,7 @@ func (a *ArmedStatement) Finish() InterruptOutcome {
 		a.mu.Lock()
 		outcome = a.outcome
 		a.mu.Unlock()
+		outcome.Interrupted = true
 	}
 	a.cancel()
 	return outcome
@@ -181,7 +195,6 @@ func (a *ArmedStatement) interrupt() {
 		a.mu.Unlock()
 		return
 	}
-	a.outcome.Interrupted = true
 	a.wake = make(chan struct{})
 	a.mu.Unlock()
 	acknowledged, fellBack := a.kill(a.wake)
