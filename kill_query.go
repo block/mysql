@@ -202,6 +202,9 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 		return fmt.Errorf("%w: %w", ErrKillQueryNotSent, err)
 	}
 	kill := "KILL QUERY " + strconv.FormatUint(uint64(target.ThreadID), 10)
+	// lastErr is why the last attempt sent nothing: the reason reported
+	// when every attempt fails.
+	var lastErr error
 	for range interrupterServerAttempts {
 		conn, err := db.Conn(ctx)
 		if err != nil {
@@ -239,11 +242,13 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 		case err == nil:
 			return nil
 		case errors.Is(err, ErrKillQueryWrongServer):
+			lastErr = ErrKillQueryWrongServer
 			continue
 		case sent && errors.Is(err, driver.ErrBadConn):
 			// The driver reports ErrBadConn only when it wrote nothing,
 			// typically on an idle connection the server has since
 			// closed: a fresh dial may succeed.
+			lastErr = err
 			continue
 		case sent:
 			return err
@@ -251,7 +256,7 @@ func (i *Interrupter) KillQuery(ctx context.Context, target KillTarget) error {
 			return fmt.Errorf("%w: %w", ErrKillQueryNotSent, err)
 		}
 	}
-	return fmt.Errorf("%w: %w (%d attempts)", ErrKillQueryNotSent, ErrKillQueryWrongServer, interrupterServerAttempts)
+	return fmt.Errorf("%w: %w (%d attempts)", ErrKillQueryNotSent, lastErr, interrupterServerAttempts)
 }
 
 // Close closes the Interrupter's connections. KillQuery fails with

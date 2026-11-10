@@ -288,6 +288,65 @@ func TestInterrupterRefusesAnotherServer(t *testing.T) {
 	}
 }
 
+// closingConnector returns connections that are already closed, as the
+// server would leave an idle connection it timed out, with their server
+// identity cached so the KILL QUERY gets as far as its write.
+type closingConnector struct{ *countingConnector }
+
+func (c closingConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.countingConnector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	mc := conn.(*mysqlConn)
+	if _, _, err := mc.readServerIdentity(ctx); err != nil {
+		return nil, err
+	}
+	mc.cleanup()
+	return mc, nil
+}
+
+// TestInterrupterRetriesAConnectionThatWroteNothing: a KILL QUERY the driver
+// refuses with ErrBadConn was never written, so each attempt redials, and
+// once they are exhausted the error says why, not that the server was wrong.
+func TestInterrupterRetriesAConnectionThatWroteNothing(t *testing.T) {
+	if !available {
+		t.Skipf("MySQL server not running on %s", netAddr)
+	}
+	connector := newCountingConnector(t)
+	interrupter := NewInterrupter(closingConnector{connector})
+	defer interrupter.Close()
+
+	db, err := sql.Open(driverNameTest, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var target KillTarget
+	if err := conn.Raw(func(driverConn any) (err error) {
+		target, err = ReadKillTarget(t.Context(), driverConn)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = interrupter.KillQuery(t.Context(), target)
+	if !errors.Is(err, ErrKillQueryNotSent) || !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("KillQuery: got %v, want ErrKillQueryNotSent wrapping driver.ErrBadConn", err)
+	}
+	if errors.Is(err, ErrKillQueryWrongServer) {
+		t.Errorf("KillQuery: got %v, which blames the server", err)
+	}
+	if n := connector.dials.Load(); n != interrupterServerAttempts {
+		t.Errorf("dialed %d interrupt connections, want %d", n, interrupterServerAttempts)
+	}
+}
+
 func TestInterrupterClose(t *testing.T) {
 	if !available {
 		t.Skipf("MySQL server not running on %s", netAddr)
