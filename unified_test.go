@@ -42,7 +42,7 @@ func unifiedExec(ctx context.Context, dbt *DBTest, query string, args []driver.N
 }
 
 // unifiedExecOn is unifiedExec on conn, with prelude run first through
-// QueryResultAfterContext when it is non-nil.
+// QueryResultContext.
 func unifiedExecOn(ctx context.Context, dbt *DBTest, conn *sql.Conn, prelude []string, query string, args []driver.NamedValue) (*unifiedResponse, error) {
 	resp := &unifiedResponse{}
 	rawErr := conn.Raw(func(dc any) error {
@@ -53,11 +53,7 @@ func unifiedExecOn(ctx context.Context, dbt *DBTest, conn *sql.Conn, prelude []s
 		var rows driver.Rows
 		var result driver.Result
 		var err error
-		if prelude == nil {
-			rows, result, err = mc.QueryResultContext(ctx, query, args)
-		} else {
-			rows, result, err = mc.QueryResultAfterContext(ctx, prelude, query, args)
-		}
+		rows, result, err = mc.QueryResultContext(ctx, prelude, query, args)
 		if err != nil {
 			return err
 		}
@@ -208,15 +204,15 @@ func TestQueryResultContext(t *testing.T) {
 	})
 }
 
-func TestQueryResultAfterContext(t *testing.T) {
+func TestQueryResultContextPrelude(t *testing.T) {
 	// Run with and without InterpolateParams, so the args case is exercised
 	// both ways.
 	for name, params := range map[string]string{"multiStatements": "&multiStatements=true", "multiStatementsInterpolateParams": "&multiStatements=true&interpolateParams=true"} {
-		t.Run(name, func(t *testing.T) { testQueryResultAfterContext(t, dsn+params) })
+		t.Run(name, func(t *testing.T) { testQueryResultContextPrelude(t, dsn+params) })
 	}
 }
 
-func testQueryResultAfterContext(t *testing.T, dsn string) {
+func testQueryResultContextPrelude(t *testing.T, dsn string) {
 	runTestsParallel(t, dsn, func(dbt *DBTest, tbl string) {
 		ctx := context.Background()
 		dbt.mustExec("CREATE TABLE " + tbl + " (id INT PRIMARY KEY AUTO_INCREMENT, note VARCHAR(16))")
@@ -349,7 +345,7 @@ func testQueryResultAfterContext(t *testing.T, dsn string) {
 		// fails after a prelude statement that warned.
 		if err := conn.Raw(func(dc any) error {
 			mc := dc.(*mysqlConn)
-			_, _, err := mc.QueryResultAfterContext(ctx, []string{"SELECT CAST('x' AS SIGNED)"}, "SELECT * FROM does_not_exist_"+tbl, nil)
+			_, _, err := mc.QueryResultContext(ctx, []string{"SELECT CAST('x' AS SIGNED)"}, "SELECT * FROM does_not_exist_"+tbl, nil)
 			var myErr *MySQLError
 			if !errors.As(err, &myErr) || myErr.Number != 1146 {
 				dbt.Fatalf("query error after warning prelude: %v", err)
@@ -370,7 +366,7 @@ func testQueryResultAfterContext(t *testing.T, dsn string) {
 	})
 }
 
-func TestQueryResultAfterContextNeedsMultiStatements(t *testing.T) {
+func TestQueryResultContextPreludeNeedsMultiStatements(t *testing.T) {
 	runTestsParallel(t, dsn, func(dbt *DBTest, tbl string) {
 		ctx := context.Background()
 		dbt.mustExec("CREATE TABLE " + tbl + " (id INT PRIMARY KEY AUTO_INCREMENT)")

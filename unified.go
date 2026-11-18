@@ -16,12 +16,12 @@ import (
 	"strings"
 )
 
-// QueryResultContext executes query and returns the server's response in the
-// form the MySQL protocol describes it: exactly one of rows or result is
-// non-nil on success. A statement that produces a resultset (even an empty
-// one) yields rows; a statement answered with an OK packet (INSERT, UPDATE,
-// DDL, SET, ...) yields result, carrying the affected-row count and last
-// insert id.
+// QueryResultContext executes query, after the statements in prelude, and
+// returns query's response in the form the MySQL protocol describes it:
+// exactly one of rows or result is non-nil on success. A statement that
+// produces a resultset (even an empty one) yields rows; a statement answered
+// with an OK packet (INSERT, UPDATE, DDL, SET, ...) yields result, carrying
+// the affected-row count and last insert id. prelude may be nil.
 //
 // database/sql callers must choose between QueryContext and ExecContext
 // before executing. A caller that receives arbitrary SQL (a proxy, a REPL)
@@ -33,9 +33,9 @@ import (
 //
 //	err := conn.Raw(func(dc any) error {
 //		uq := dc.(interface {
-//			QueryResultContext(context.Context, string, []driver.NamedValue) (driver.Rows, driver.Result, error)
+//			QueryResultContext(context.Context, []string, string, []driver.NamedValue) (driver.Rows, driver.Result, error)
 //		})
-//		rows, result, err := uq.QueryResultContext(ctx, query, args)
+//		rows, result, err := uq.QueryResultContext(ctx, nil, query, args)
 //		...
 //	})
 //
@@ -53,16 +53,14 @@ import (
 // next Next or Close call. Nothing is parsed into Go types (parseTime does
 // not apply), so values forward verbatim — zero dates, float representations,
 // and fractional-second padding survive untouched.
-func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
-	return mc.queryResultContext(ctx, nil, query, args)
-}
-
-// QueryResultAfterContext is QueryResultContext with prelude run first, in
-// the same round trip: the prelude statements and query are sent as one
-// multi-statement COM_QUERY, the prelude's responses are read and discarded,
-// and query's response is returned exactly as QueryResultContext returns it.
-// The result's counters (RowsAffected, LastInsertId, AllRowsAffected) and the
-// warning count describe query alone.
+//
+// # Prelude
+//
+// A non-empty prelude is sent ahead of query in the same round trip, as one
+// multi-statement COM_QUERY. The prelude's responses are read and discarded,
+// and query's response is returned as described above. The result's counters
+// (RowsAffected, LastInsertId, AllRowsAffected) and the warning count
+// describe query alone.
 //
 // A caller that must run a statement before another on the same connection —
 // BEGIN before a transaction's first statement, or session settings before a
@@ -77,8 +75,7 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 // unknown: it may have run every statement, query included.
 //
 // Each prelude entry must be exactly one statement, without a trailing
-// semicolon, and takes no args: args apply to query alone. With an empty
-// prelude this is QueryResultContext.
+// semicolon, and takes no args: args apply to query alone.
 //
 // The prelude's responses are matched to its entries one result each, so an
 // entry must be a statement that always answers with exactly one result:
@@ -92,15 +89,49 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 // a query or string arg containing one is declined.
 //
 // Sending several statements in one command needs the MultiStatements
-// option. A declined call returns driver.ErrSkip before anything is written
-// — without MultiStatements, for a prelude entry of another kind, or for a
-// backslash after a SET — so the caller can fall back to running the
+// option. A declined prelude returns driver.ErrSkip before anything is
+// written — without MultiStatements, for a prelude entry of another kind, or
+// for a backslash after a SET — so the caller can fall back to running the
 // statements one at a time.
-func (mc *mysqlConn) QueryResultAfterContext(ctx context.Context, prelude []string, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
-	return mc.queryResultContext(ctx, prelude, query, args)
+func (mc *mysqlConn) QueryResultContext(ctx context.Context, prelude []string, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
+	if mc.closed.Load() {
+		return nil, nil, driver.ErrBadConn
+	}
+
+	// Reject named parameters exactly as QueryContext and ExecContext do.
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Raw bypasses database/sql's argument conversion, which on the normal
+	// path runs CheckNamedValue before the driver sees the args. Apply it
+	// here so interpolateParams gets the same values either way.
+	for i := range dargs {
+		nv := driver.NamedValue{Ordinal: i + 1, Value: dargs[i]}
+		if err := mc.CheckNamedValue(&nv); err != nil {
+			return nil, nil, err
+		}
+		dargs[i] = nv.Value
+	}
+
+	if err := mc.watchCancel(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	rows, result, err := mc.queryResult(prelude, query, dargs)
+	if err != nil || rows == nil {
+		// Error, or a complete OK response: the connection is idle again.
+		mc.finish()
+		return nil, result, err
+	}
+	// Resultset: the context watcher stays armed until the caller finishes
+	// reading, mirroring QueryContext.
+	rows.finish = mc.finish
+	return rows, nil, nil
 }
 
-// PreludeError reports that a prelude statement of QueryResultAfterContext
+// PreludeError reports that a prelude statement of QueryResultContext
 // failed. The server stops at the first statement that fails, so neither the
 // rest of the prelude nor the query was executed.
 type PreludeError struct {
@@ -122,7 +153,7 @@ func (e *PreludeError) Unwrap() error { return e.Err }
 var errPreludeIncomplete = errors.New("the server's response ended before every prelude statement answered; each prelude entry must be exactly one statement")
 
 // preludeStatement classifies a prelude entry by its leading keywords:
-// whether QueryResultAfterContext accepts it (it always answers with exactly
+// whether QueryResultContext accepts it (it always answers with exactly
 // one result), and whether it may change how the server parses what follows
 // (sql_mode, the character set).
 func preludeStatement(statement string) (accepted, changesParsing bool) {
@@ -188,50 +219,11 @@ func asPreludeError(index int, err error) error {
 	return err
 }
 
-func (mc *mysqlConn) queryResultContext(ctx context.Context, prelude []string, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
-	if mc.closed.Load() {
-		return nil, nil, driver.ErrBadConn
-	}
-
-	// Reject named parameters exactly as QueryContext and ExecContext do.
-	dargs, err := namedValueToValue(args)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Raw bypasses database/sql's argument conversion, which on the normal
-	// path runs CheckNamedValue before the driver sees the args. Apply it
-	// here so interpolateParams gets the same values either way.
-	for i := range dargs {
-		nv := driver.NamedValue{Ordinal: i + 1, Value: dargs[i]}
-		if err := mc.CheckNamedValue(&nv); err != nil {
-			return nil, nil, err
-		}
-		dargs[i] = nv.Value
-	}
-
-	if err := mc.watchCancel(ctx); err != nil {
-		return nil, nil, err
-	}
-
-	rows, result, err := mc.queryResult(prelude, query, dargs)
-	if err != nil || rows == nil {
-		// Error, or a complete OK response: the connection is idle again.
-		mc.finish()
-		return nil, result, err
-	}
-	// Resultset: the context watcher stays armed until the caller finishes
-	// reading, mirroring QueryContext.
-	rows.finish = mc.finish
-	return rows, nil, nil
-}
-
-// queryResult is the transport half of QueryResultContext and
-// QueryResultAfterContext. It mirrors mysqlConn.query, except that an OK
-// response is surfaced as a driver.Result (the way Exec reports it) instead
-// of being hidden inside an empty, done resultset, and that prelude
-// statements, when there are any, are sent ahead of query in the same
-// command and their responses discarded.
+// queryResult is the transport half of QueryResultContext. It mirrors
+// mysqlConn.query, except that an OK response is surfaced as a driver.Result
+// (the way Exec reports it) instead of being hidden inside an empty, done
+// resultset, and that prelude statements, when there are any, are sent ahead
+// of query in the same command and their responses discarded.
 func (mc *mysqlConn) queryResult(prelude []string, query string, args []driver.Value) (*textRows, driver.Result, error) {
 	handleOk := mc.clearResult()
 
