@@ -41,9 +41,16 @@ func unifiedExec(ctx context.Context, dbt *DBTest, query string, args []driver.N
 	return unifiedExecOn(ctx, dbt, conn, nil, query, args)
 }
 
-// unifiedExecOn is unifiedExec on conn, with prelude run first through
-// QueryResultContext.
-func unifiedExecOn(ctx context.Context, dbt *DBTest, conn *sql.Conn, prelude []string, query string, args []driver.NamedValue) (*unifiedResponse, error) {
+// unifiedExecOn is unifiedExec on conn, with the prelude statements run first
+// through QueryResultContext.
+func unifiedExecOn(ctx context.Context, dbt *DBTest, conn *sql.Conn, statements []string, query string, args []driver.NamedValue) (*unifiedResponse, error) {
+	var prelude *Prelude
+	if statements != nil {
+		var err error
+		if prelude, err = NewPrelude(statements...); err != nil {
+			dbt.Fatalf("NewPrelude(%q): %s", statements, err)
+		}
+	}
 	resp := &unifiedResponse{}
 	rawErr := conn.Raw(func(dc any) error {
 		mc, ok := dc.(*mysqlConn)
@@ -299,53 +306,40 @@ func testQueryResultContextPrelude(t *testing.T, dsn string) {
 			dbt.Fatalf("rollback: %s", err)
 		}
 
-		// A statement that can answer with several results, or that the
-		// driver cannot classify, is declined before anything is written.
-		for _, statement := range []string{"CALL does_not_exist()", "/*!40101 SET @x = 1 */", "INSERT INTO " + tbl + " (note) VALUES ('x')"} {
-			if _, err := unifiedExecOn(ctx, dbt, conn, []string{statement}, "INSERT INTO "+tbl+" (note) VALUES ('e')", nil); !errors.Is(err, driver.ErrSkip) {
-				dbt.Fatalf("prelude %q: %v, want driver.ErrSkip", statement, err)
+		// Args are escaped for the mode the query runs in. Turn
+		// NO_BACKSLASH_ESCAPES on, so that a prelude that leaves sql_mode
+		// alone keeps it, and one that sets sql_mode turns it off: both are
+		// read correctly only if escaping follows.
+		tricky := []driver.NamedValue{{Ordinal: 1, Value: `it's a \ back\'slash`}}
+		for _, statements := range [][]string{{"BEGIN"}, {"SET SESSION sql_mode = 'TRADITIONAL'"}} {
+			if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"); err != nil {
+				dbt.Fatalf("set sql_mode: %s", err)
 			}
-		}
-		if got := count(); got != "1" {
-			dbt.Fatalf("rows after declined preludes: %s, want 1", got)
-		}
-
-		// A SET may change sql_mode before the query is parsed: args are then
-		// escaped in the form both modes read the same way.
-		quoted := []driver.NamedValue{{Ordinal: 1, Value: "it's"}}
-		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"}, "SELECT ?", quoted)
-		if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
-			dbt.Fatalf("reset sql_mode: %s", resetErr)
-		}
-		if err != nil {
-			if !errors.Is(err, driver.ErrSkip) {
-				dbt.Fatalf("quote arg after sql_mode SET: %s", err)
+			resp, err = unifiedExecOn(ctx, dbt, conn, statements, "SELECT ?", tricky)
+			if _, resetErr := conn.ExecContext(ctx, "ROLLBACK"); resetErr != nil {
+				dbt.Fatalf("rollback: %s", resetErr)
 			}
-		} else if string(resp.rows[0][0]) != "it's" {
-			dbt.Fatalf("quote arg after sql_mode SET: %q, want %q", resp.rows[0][0], "it's")
-		}
-
-		// A backslash has no form both modes read the same way: after a SET
-		// it is declined, after a prelude that cannot change parsing it is
-		// interpolated as usual.
-		backslash := []driver.NamedValue{{Ordinal: 1, Value: `a\b`}}
-		if _, err := unifiedExecOn(ctx, dbt, conn, []string{"SET @y = 1"}, "SELECT ?", backslash); !errors.Is(err, driver.ErrSkip) {
-			dbt.Fatalf("backslash arg after SET: %v, want driver.ErrSkip", err)
-		}
-		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SELECT 1"}, "SELECT ?", backslash)
-		if err != nil {
-			if !errors.Is(err, driver.ErrSkip) {
-				dbt.Fatalf("backslash arg after SELECT: %s", err)
+			if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
+				dbt.Fatalf("reset sql_mode: %s", resetErr)
 			}
-		} else if string(resp.rows[0][0]) != `a\b` {
-			dbt.Fatalf("backslash arg after SELECT: %q", resp.rows[0][0])
+			if err != nil {
+				if !errors.Is(err, driver.ErrSkip) {
+					dbt.Fatalf("arg after %q: %s", statements, err)
+				}
+			} else if string(resp.rows[0][0]) != tricky[0].Value {
+				dbt.Fatalf("arg after %q: %q, want %q", statements, resp.rows[0][0], tricky[0].Value)
+			}
 		}
 
 		// The warning count describes the query alone, even when the query
 		// fails after a prelude statement that warned.
 		if err := conn.Raw(func(dc any) error {
 			mc := dc.(*mysqlConn)
-			_, _, err := mc.QueryResultContext(ctx, []string{"SELECT CAST('x' AS SIGNED)"}, "SELECT * FROM does_not_exist_"+tbl, nil)
+			prelude, err := NewPrelude("SELECT CAST('x' AS SIGNED)")
+			if err != nil {
+				dbt.Fatalf("NewPrelude: %s", err)
+			}
+			_, _, err = mc.QueryResultContext(ctx, prelude, "SELECT * FROM does_not_exist_"+tbl, nil)
 			var myErr *MySQLError
 			if !errors.As(err, &myErr) || myErr.Number != 1146 {
 				dbt.Fatalf("query error after warning prelude: %v", err)
@@ -387,34 +381,77 @@ func TestQueryResultContextPreludeNeedsMultiStatements(t *testing.T) {
 	})
 }
 
-func TestPreludeStatement(t *testing.T) {
+func TestNewPrelude(t *testing.T) {
 	for _, tt := range []struct {
-		statement                string
-		accepted, changesParsing bool
+		statement            string
+		accepted             bool
+		setsBackslashEscapes bool
 	}{
-		{"BEGIN", true, false},
-		{"  begin work", true, false},
-		{"/* why */ BEGIN", true, false},
-		{"-- why\nBEGIN", true, false},
-		{"# why\nSTART TRANSACTION READ ONLY", true, false},
-		{"START REPLICA", false, false},
-		{"SAVEPOINT s1", true, false},
-		{"RELEASE SAVEPOINT s1", true, false},
-		{"ROLLBACK TO SAVEPOINT s1", true, false},
-		{"COMMIT", true, false},
-		{"SELECT 1", true, false},
-		{"SET @@session.sql_mode = ''", true, true},
-		{"set names utf8mb4", true, true},
-		{"CALL p()", false, false},
-		{"INSERT INTO t VALUES (1)", false, false},
-		{"/*!40101 SET @x = 1 */", false, false},
-		{"--BEGIN", false, false},
-		{"/* unterminated BEGIN", false, false},
-		{"", false, false},
+		{statement: "BEGIN", accepted: true},
+		{statement: "  begin work", accepted: true},
+		{statement: "/* why */ BEGIN", accepted: true},
+		{statement: "-- why\nBEGIN", accepted: true},
+		{statement: "# why\nSTART TRANSACTION READ ONLY", accepted: true},
+		{statement: "BEGIN -- trailing", accepted: true},
+		{statement: "SAVEPOINT s1", accepted: true},
+		{statement: "RELEASE SAVEPOINT s1", accepted: true},
+		{statement: "ROLLBACK TO SAVEPOINT s1", accepted: true},
+		{statement: "COMMIT", accepted: true},
+		{statement: "SELECT 1, 'a;b', `c;d`, \"e;f\"", accepted: true},
+		{statement: "SET @x = 'it''s', @y := 2", accepted: true},
+		{statement: "SET innodb_lock_wait_timeout = 30, time_zone = '+00:00'", accepted: true},
+		{statement: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", accepted: true},
+		{statement: "SET @x = CONCAT('a', 'b'), max_execution_time = 10", accepted: true},
+		{statement: "SET sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE'", accepted: true, setsBackslashEscapes: true},
+		{statement: "SET innodb_lock_wait_timeout = 30, sql_mode = 'TRADITIONAL'", accepted: true, setsBackslashEscapes: true},
+		{statement: "SET @@session.sql_mode = ''", accepted: true, setsBackslashEscapes: true},
+		{statement: "SET SESSION sql_mode = \"ANSI\"", accepted: true, setsBackslashEscapes: true},
+		{statement: "set local `SQL_MODE` = TRADITIONAL", accepted: true, setsBackslashEscapes: true},
+		{statement: "SET @sql_mode = 'NO_BACKSLASH_ESCAPES'", accepted: true},
+
+		// Not one result each.
+		{statement: "CALL p()"},
+		{statement: "INSERT INTO t VALUES (1)"},
+		{statement: "START REPLICA"},
+		{statement: "BEGIN; DELETE FROM t"},
+		{statement: "BEGIN;"},
+		{statement: "/*!40101 SET @x = 1 */"},
+		{statement: "SET @x = 1 /*!; DELETE FROM t */"},
+		{statement: "--BEGIN"},
+		{statement: ""},
+		{statement: "/* unterminated BEGIN"},
+		{statement: "SELECT 'unterminated"},
+		// Changes how the query's args are read.
+		{statement: "SET sql_mode = 'NO_BACKSLASH_ESCAPES'"},
+		{statement: "SET sql_mode = 'ANSI_QUOTES, no_backslash_escapes'"},
+		{statement: "SET sql_mode = DEFAULT"},
+		{statement: "SET sql_mode = @saved"},
+		{statement: "SET sql_mode = 2097152"},
+		{statement: "SET sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')"},
+		{statement: "SET @@session.`sql_mode` = ''"},
+		{statement: "SET GLOBAL sql_mode = ''"},
+		{statement: "SET @@global.time_zone = '+00:00'"},
+		{statement: "SET NAMES gbk"},
+		{statement: "SET CHARACTER SET sjis"},
+		{statement: "SET character_set_client = big5"},
+		{statement: "SET @x = 'a\\'"},
+		{statement: "SET ROLE r"},
 	} {
-		accepted, changesParsing := preludeStatement(tt.statement)
-		if accepted != tt.accepted || changesParsing != tt.changesParsing {
-			t.Errorf("preludeStatement(%q) = %v, %v; want %v, %v", tt.statement, accepted, changesParsing, tt.accepted, tt.changesParsing)
+		p, err := NewPrelude("BEGIN", tt.statement)
+		if accepted := err == nil; accepted != tt.accepted {
+			t.Errorf("NewPrelude(%q): %v, want accepted=%v", tt.statement, err, tt.accepted)
+			continue
 		}
+		if err == nil && p.setsBackslashEscapes != tt.setsBackslashEscapes {
+			t.Errorf("NewPrelude(%q).setsBackslashEscapes = %v, want %v", tt.statement, p.setsBackslashEscapes, tt.setsBackslashEscapes)
+		}
+	}
+
+	p, err := NewPrelude("BEGIN", "SET @x = 1 # why")
+	if err != nil || p.Len() != 2 || p.text != "BEGIN\n;SET @x = 1 # why\n;" {
+		t.Errorf("NewPrelude text: %v %+v", err, p)
+	}
+	if n := (*Prelude)(nil).Len(); n != 0 {
+		t.Errorf("nil Prelude Len = %d", n)
 	}
 }
