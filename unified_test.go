@@ -306,29 +306,37 @@ func testQueryResultContextPrelude(t *testing.T, dsn string) {
 			dbt.Fatalf("rollback: %s", err)
 		}
 
-		// Args are escaped for the mode the query runs in. Turn
-		// NO_BACKSLASH_ESCAPES on, so that a prelude that leaves sql_mode
-		// alone keeps it, and one that sets sql_mode turns it off: both are
-		// read correctly only if escaping follows.
+		// Args are escaped for backslash escapes, which a prelude that sets
+		// sql_mode leaves on.
 		tricky := []driver.NamedValue{{Ordinal: 1, Value: `it's a \ back\'slash`}}
-		for _, statements := range [][]string{{"BEGIN"}, {"SET SESSION sql_mode = 'TRADITIONAL'"}} {
-			if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"); err != nil {
-				dbt.Fatalf("set sql_mode: %s", err)
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SET SESSION sql_mode = 'TRADITIONAL'"}, "SELECT ?", tricky)
+		if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
+			dbt.Fatalf("reset sql_mode: %s", resetErr)
+		}
+		if err != nil {
+			if !errors.Is(err, driver.ErrSkip) {
+				dbt.Fatalf("arg after sql_mode SET: %s", err)
 			}
-			resp, err = unifiedExecOn(ctx, dbt, conn, statements, "SELECT ?", tricky)
-			if _, resetErr := conn.ExecContext(ctx, "ROLLBACK"); resetErr != nil {
-				dbt.Fatalf("rollback: %s", resetErr)
-			}
-			if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
-				dbt.Fatalf("reset sql_mode: %s", resetErr)
-			}
-			if err != nil {
-				if !errors.Is(err, driver.ErrSkip) {
-					dbt.Fatalf("arg after %q: %s", statements, err)
-				}
-			} else if string(resp.rows[0][0]) != tricky[0].Value {
-				dbt.Fatalf("arg after %q: %q, want %q", statements, resp.rows[0][0], tricky[0].Value)
-			}
+		} else if string(resp.rows[0][0]) != tricky[0].Value {
+			dbt.Fatalf("arg after sql_mode SET: %q, want %q", resp.rows[0][0], tricky[0].Value)
+		}
+
+		// On a connection in NO_BACKSLASH_ESCAPES mode, where a prelude
+		// could turn the mode off before the query is read, a prelude with
+		// args is declined before anything is written. Without args it runs.
+		if _, err := conn.ExecContext(ctx, "SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"); err != nil {
+			dbt.Fatalf("set sql_mode: %s", err)
+		}
+		_, skipErr := unifiedExecOn(ctx, dbt, conn, []string{"SET SESSION sql_mode = 'TRADITIONAL'"}, "SELECT ?", tricky)
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SELECT 1"}, "SELECT @@session.sql_mode", nil)
+		if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
+			dbt.Fatalf("reset sql_mode: %s", resetErr)
+		}
+		if !errors.Is(skipErr, driver.ErrSkip) {
+			dbt.Fatalf("args after a prelude in NO_BACKSLASH_ESCAPES mode: %v, want driver.ErrSkip", skipErr)
+		}
+		if err != nil || string(resp.rows[0][0]) != "NO_BACKSLASH_ESCAPES" {
+			dbt.Fatalf("no-args prelude in NO_BACKSLASH_ESCAPES mode: %v %v", resp, err)
 		}
 
 		// The warning count describes the query alone, even when the query
@@ -383,9 +391,8 @@ func TestQueryResultContextPreludeNeedsMultiStatements(t *testing.T) {
 
 func TestNewPrelude(t *testing.T) {
 	for _, tt := range []struct {
-		statement            string
-		accepted             bool
-		setsBackslashEscapes bool
+		statement string
+		accepted  bool
 	}{
 		{statement: "BEGIN", accepted: true},
 		{statement: "  begin work", accepted: true},
@@ -402,11 +409,11 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "SET innodb_lock_wait_timeout = 30, time_zone = '+00:00'", accepted: true},
 		{statement: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED", accepted: true},
 		{statement: "SET @x = CONCAT('a', 'b'), max_execution_time = 10", accepted: true},
-		{statement: "SET sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE'", accepted: true, setsBackslashEscapes: true},
-		{statement: "SET innodb_lock_wait_timeout = 30, sql_mode = 'TRADITIONAL'", accepted: true, setsBackslashEscapes: true},
-		{statement: "SET @@session.sql_mode = ''", accepted: true, setsBackslashEscapes: true},
-		{statement: "SET SESSION sql_mode = \"ANSI\"", accepted: true, setsBackslashEscapes: true},
-		{statement: "set local `SQL_MODE` = TRADITIONAL", accepted: true, setsBackslashEscapes: true},
+		{statement: "SET sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE'", accepted: true},
+		{statement: "SET innodb_lock_wait_timeout = 30, sql_mode = 'TRADITIONAL'", accepted: true},
+		{statement: "SET @@session.sql_mode = ''", accepted: true},
+		{statement: "SET SESSION sql_mode = \"ANSI\"", accepted: true},
+		{statement: "set local `SQL_MODE` = TRADITIONAL", accepted: true},
 		{statement: "SET @sql_mode = 'NO_BACKSLASH_ESCAPES'", accepted: true},
 
 		// Not one result each.
@@ -437,13 +444,9 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "SET @x = 'a\\'"},
 		{statement: "SET ROLE r"},
 	} {
-		p, err := NewPrelude("BEGIN", tt.statement)
+		_, err := NewPrelude("BEGIN", tt.statement)
 		if accepted := err == nil; accepted != tt.accepted {
 			t.Errorf("NewPrelude(%q): %v, want accepted=%v", tt.statement, err, tt.accepted)
-			continue
-		}
-		if err == nil && p.setsBackslashEscapes != tt.setsBackslashEscapes {
-			t.Errorf("NewPrelude(%q).setsBackslashEscapes = %v, want %v", tt.statement, p.setsBackslashEscapes, tt.setsBackslashEscapes)
 		}
 	}
 

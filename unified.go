@@ -71,15 +71,16 @@ import (
 // own, or a read or write failure after which what the server executed is
 // unknown: it may have run every statement, query included.
 //
-// Args apply to query alone. NewPrelude has already refused any statement
-// that would change how the server reads them, so they are interpolated for
-// the sql_mode query will run in: the one the prelude sets, or else the
-// connection's current one.
+// Args apply to query alone, and are escaped for backslash escapes, which
+// NewPrelude has made sure the prelude leaves on. On a connection in
+// NO_BACKSLASH_ESCAPES mode a prelude with args is declined with
+// driver.ErrSkip, since a prelude that sets sql_mode would turn the mode off
+// before query is read.
 //
 // Sending several statements in one command needs the MultiStatements
-// option; without it a non-empty prelude returns driver.ErrSkip before
-// anything is written, so the caller can fall back to running the statements
-// one at a time.
+// option; without it a non-empty prelude returns driver.ErrSkip. Every
+// declined call returns before anything is written, so the caller can fall
+// back to running the statements one at a time.
 func (mc *mysqlConn) QueryResultContext(ctx context.Context, prelude *Prelude, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
 	if mc.closed.Load() {
 		return nil, nil, driver.ErrBadConn
@@ -134,16 +135,15 @@ func (mc *mysqlConn) queryResult(prelude *Prelude, query string, args []driver.V
 		if !mc.cfg.InterpolateParams {
 			return nil, nil, driver.ErrSkip
 		}
-		// Escape for the mode query will be read in: a prelude that sets
-		// sql_mode leaves backslash escapes on (NewPrelude refuses
-		// NO_BACKSLASH_ESCAPES), and one that does not leaves the mode as
-		// it is now.
-		noBackslashEscapes := mc.status&statusNoBackslashEscapes != 0
-		if count != 0 && prelude.setsBackslashEscapes {
-			noBackslashEscapes = false
+		// The args are escaped for the mode the connection is in now, and
+		// the prelude must leave it: NewPrelude refuses
+		// NO_BACKSLASH_ESCAPES, so only a connection already in that mode
+		// could see it change, and there a prelude is declined.
+		if count != 0 && mc.status&statusNoBackslashEscapes != 0 {
+			return nil, nil, driver.ErrSkip
 		}
 		// try client-side prepare to reduce roundtrip
-		prepared, err := mc.interpolateParamsWith(query, args, noBackslashEscapes)
+		prepared, err := mc.interpolateParams(query, args)
 		if err != nil {
 			return nil, nil, err
 		}

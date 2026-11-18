@@ -25,10 +25,6 @@ type Prelude struct {
 	// follows it.
 	text  string
 	count int
-	// setsBackslashEscapes reports that the prelude assigns sql_mode a
-	// value without NO_BACKSLASH_ESCAPES: in the query after it a backslash
-	// escapes in string literals, whatever the mode was before.
-	setsBackslashEscapes bool
 }
 
 // Len returns the number of statements in p.
@@ -50,14 +46,17 @@ func (p *Prelude) Len() int {
 // allowed; executable comments (/*! ... */) are code and are refused.
 //
 // QueryResultContext interpolates the query's args before the server runs the
-// prelude, so the prelude must not change how the server reads them:
+// prelude, escaping them for backslash escapes (it declines a prelude with
+// args on a connection in NO_BACKSLASH_ESCAPES mode), so the prelude must not
+// change how the server reads them:
 //
 //   - A statement may not contain a backslash. Whether a backslash escapes
 //     depends on NO_BACKSLASH_ESCAPES, so where the statement's string
 //     literals end would depend on the connection's mode.
 //   - A SET that assigns sql_mode must give it a quoted literal or a bare
-//     mode name, without NO_BACKSLASH_ESCAPES, so the mode the query is read
-//     in is known. DEFAULT, numbers, variables and expressions are refused.
+//     mode name without NO_BACKSLASH_ESCAPES, so that backslash escapes stay
+//     on. DEFAULT, numbers, variables and expressions are refused, because
+//     what they set cannot be known here.
 //   - A SET may not change the character set the server reads the query in:
 //     SET NAMES, SET CHARACTER SET and character_set_client are refused.
 //   - A SET may not assign a GLOBAL or PERSIST variable.
@@ -65,11 +64,9 @@ func NewPrelude(statements ...string) (*Prelude, error) {
 	p := &Prelude{count: len(statements)}
 	var text strings.Builder
 	for i, statement := range statements {
-		setsBackslashEscapes, err := checkPreludeStatement(statement)
-		if err != nil {
+		if err := checkPreludeStatement(statement); err != nil {
 			return nil, fmt.Errorf("mysql: prelude statement %d: %w", i, err)
 		}
-		p.setsBackslashEscapes = p.setsBackslashEscapes || setsBackslashEscapes
 		text.WriteString(statement)
 		text.WriteString("\n;")
 	}
@@ -77,49 +74,48 @@ func NewPrelude(statements ...string) (*Prelude, error) {
 	return p, nil
 }
 
-// checkPreludeStatement validates one prelude statement, reporting whether
-// it sets sql_mode to a value in which a backslash escapes.
-func checkPreludeStatement(statement string) (setsBackslashEscapes bool, err error) {
+// checkPreludeStatement validates one prelude statement.
+func checkPreludeStatement(statement string) error {
 	if strings.IndexByte(statement, '\\') >= 0 {
-		return false, errors.New("contains a backslash")
+		return errors.New("contains a backslash")
 	}
 	tokens, err := scanPreludeStatement(statement)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if len(tokens) == 0 || tokens[0].kind != tokenWord {
-		return false, errors.New("is not a statement the prelude accepts")
+		return errors.New("is not a statement the prelude accepts")
 	}
 	second := func(word string) bool {
 		return len(tokens) > 1 && tokens[1].is(word)
 	}
 	switch strings.ToUpper(tokens[0].text) {
 	case "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "SELECT":
-		return false, nil
+		return nil
 	case "START":
 		if second("TRANSACTION") {
-			return false, nil
+			return nil
 		}
 	case "RELEASE":
 		if second("SAVEPOINT") {
-			return false, nil
+			return nil
 		}
 	case "SET":
 		return checkPreludeSet(tokens[1:])
 	}
-	return false, fmt.Errorf("%s is not a statement the prelude accepts", tokens[0].text)
+	return fmt.Errorf("%s is not a statement the prelude accepts", tokens[0].text)
 }
 
 // checkPreludeSet validates the body of a prelude SET statement.
-func checkPreludeSet(tokens []preludeToken) (setsBackslashEscapes bool, err error) {
+func checkPreludeSet(tokens []preludeToken) error {
 	if len(tokens) == 0 {
-		return false, errors.New("SET assigns nothing")
+		return errors.New("SET assigns nothing")
 	}
 	switch {
 	case tokens[0].is("NAMES"), tokens[0].is("CHARACTER"), tokens[0].is("CHARSET"):
-		return false, errors.New("changes the character set the query is read in")
+		return errors.New("changes the character set the query is read in")
 	case tokens[0].is("TRANSACTION"):
-		return false, nil
+		return nil
 	}
 	for _, assignment := range splitTopLevel(tokens) {
 		eq := -1
@@ -130,23 +126,22 @@ func checkPreludeSet(tokens []preludeToken) (setsBackslashEscapes bool, err erro
 			}
 		}
 		if eq < 0 {
-			return false, errors.New("SET is not a list of variable assignments")
+			return errors.New("SET is not a list of variable assignments")
 		}
 		name, err := preludeSetTarget(assignment[:eq])
 		if err != nil {
-			return false, err
+			return err
 		}
 		switch name {
 		case "sql_mode":
 			if err := checkPreludeSQLMode(assignment[eq+1:]); err != nil {
-				return false, err
+				return err
 			}
-			setsBackslashEscapes = true
 		case "character_set_client":
-			return false, errors.New("changes the character set the query is read in")
+			return errors.New("changes the character set the query is read in")
 		}
 	}
-	return setsBackslashEscapes, nil
+	return nil
 }
 
 // preludeSetTarget returns the lower-case name of the session system
@@ -181,9 +176,8 @@ func preludeSetTarget(target []preludeToken) (string, error) {
 	return "", errors.New("assigns a variable the prelude cannot name")
 }
 
-// checkPreludeSQLMode validates the value assigned to sql_mode: a literal,
-// so that the mode the query is read in is known, without
-// NO_BACKSLASH_ESCAPES.
+// checkPreludeSQLMode validates the value assigned to sql_mode: a literal
+// without NO_BACKSLASH_ESCAPES, so that backslash escapes stay on.
 func checkPreludeSQLMode(value []preludeToken) error {
 	if len(value) != 1 {
 		return errors.New("sets sql_mode to a value that is not a literal")

@@ -270,13 +270,7 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (mc *mysqlConn) interpolateParams(query string, args []driver.Value) (string, error) {
-	return mc.interpolateParamsWith(query, args, mc.status&statusNoBackslashEscapes != 0)
-}
-
-// interpolateParamsWith is interpolateParams for a query the server will read
-// with NO_BACKSLASH_ESCAPES in effect or not, as noBackslashEscapes says,
-// rather than as the connection's current mode is.
-func (mc *mysqlConn) interpolateParamsWith(query string, args []driver.Value, noBackslashEscapes bool) (string, error) {
+	noBackslashEscapes := (mc.status & statusNoBackslashEscapes) != 0
 	const (
 		stateNormal = iota
 		stateString
