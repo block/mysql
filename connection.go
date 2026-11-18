@@ -9,6 +9,7 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -270,7 +271,39 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 }
 
 func (mc *mysqlConn) interpolateParams(query string, args []driver.Value) (string, error) {
+	return mc.interpolateParamsMode(query, args, false)
+}
+
+// interpolateParamsMode is interpolateParams. With modeNeutral it produces
+// text that the server reads the same way whether or not NO_BACKSLASH_ESCAPES
+// is in effect when it parses it — what a query sent after statements that
+// may change sql_mode needs, since the mode the server will use is not known
+// here. Quotes are escaped by doubling, which means the same in both modes,
+// and the only byte whose meaning differs, the backslash, must not appear in
+// query or in any string-like arg: driver.ErrSkip is returned if it does.
+func (mc *mysqlConn) interpolateParamsMode(query string, args []driver.Value, modeNeutral bool) (string, error) {
 	noBackslashEscapes := (mc.status & statusNoBackslashEscapes) != 0
+	if modeNeutral {
+		if strings.IndexByte(query, '\\') >= 0 {
+			return "", driver.ErrSkip
+		}
+		for _, arg := range args {
+			var hasBackslash bool
+			switch v := arg.(type) {
+			case string:
+				hasBackslash = strings.IndexByte(v, '\\') >= 0
+			case []byte:
+				hasBackslash = bytes.IndexByte(v, '\\') >= 0
+			case json.RawMessage:
+				hasBackslash = bytes.IndexByte(v, '\\') >= 0
+			}
+			if hasBackslash {
+				return "", driver.ErrSkip
+			}
+		}
+		// Doubling quotes is the escaping both modes accept.
+		noBackslashEscapes = true
+	}
 	const (
 		stateNormal = iota
 		stateString

@@ -293,6 +293,75 @@ func testQueryResultAfterContext(t *testing.T, dsn string) {
 			dbt.Fatalf("rows after ROLLBACK: %s, want 1 (the failed query ended the transaction)", got)
 		}
 
+		// A trailing line comment in a prelude entry ends at its line: it
+		// cannot swallow the statements after it.
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"BEGIN -- open the transaction", "SET @commented = 7 # set it"}, "SELECT @commented", nil)
+		if err != nil || !resp.isResultset || string(resp.rows[0][0]) != "7" {
+			dbt.Fatalf("prelude with trailing comments: %v %v", resp, err)
+		}
+		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			dbt.Fatalf("rollback: %s", err)
+		}
+
+		// A statement that can answer with several results, or that the
+		// driver cannot classify, is declined before anything is written.
+		for _, statement := range []string{"CALL does_not_exist()", "/*!40101 SET @x = 1 */", "INSERT INTO " + tbl + " (note) VALUES ('x')"} {
+			if _, err := unifiedExecOn(ctx, dbt, conn, []string{statement}, "INSERT INTO "+tbl+" (note) VALUES ('e')", nil); !errors.Is(err, driver.ErrSkip) {
+				dbt.Fatalf("prelude %q: %v, want driver.ErrSkip", statement, err)
+			}
+		}
+		if got := count(); got != "1" {
+			dbt.Fatalf("rows after declined preludes: %s, want 1", got)
+		}
+
+		// A SET may change sql_mode before the query is parsed: args are then
+		// escaped in the form both modes read the same way.
+		quoted := []driver.NamedValue{{Ordinal: 1, Value: "it's"}}
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'"}, "SELECT ?", quoted)
+		if _, resetErr := conn.ExecContext(ctx, "SET SESSION sql_mode = DEFAULT"); resetErr != nil {
+			dbt.Fatalf("reset sql_mode: %s", resetErr)
+		}
+		if err != nil {
+			if !errors.Is(err, driver.ErrSkip) {
+				dbt.Fatalf("quote arg after sql_mode SET: %s", err)
+			}
+		} else if string(resp.rows[0][0]) != "it's" {
+			dbt.Fatalf("quote arg after sql_mode SET: %q, want %q", resp.rows[0][0], "it's")
+		}
+
+		// A backslash has no form both modes read the same way: after a SET
+		// it is declined, after a prelude that cannot change parsing it is
+		// interpolated as usual.
+		backslash := []driver.NamedValue{{Ordinal: 1, Value: `a\b`}}
+		if _, err := unifiedExecOn(ctx, dbt, conn, []string{"SET @y = 1"}, "SELECT ?", backslash); !errors.Is(err, driver.ErrSkip) {
+			dbt.Fatalf("backslash arg after SET: %v, want driver.ErrSkip", err)
+		}
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SELECT 1"}, "SELECT ?", backslash)
+		if err != nil {
+			if !errors.Is(err, driver.ErrSkip) {
+				dbt.Fatalf("backslash arg after SELECT: %s", err)
+			}
+		} else if string(resp.rows[0][0]) != `a\b` {
+			dbt.Fatalf("backslash arg after SELECT: %q", resp.rows[0][0])
+		}
+
+		// The warning count describes the query alone, even when the query
+		// fails after a prelude statement that warned.
+		if err := conn.Raw(func(dc any) error {
+			mc := dc.(*mysqlConn)
+			_, _, err := mc.QueryResultAfterContext(ctx, []string{"SELECT CAST('x' AS SIGNED)"}, "SELECT * FROM does_not_exist_"+tbl, nil)
+			var myErr *MySQLError
+			if !errors.As(err, &myErr) || myErr.Number != 1146 {
+				dbt.Fatalf("query error after warning prelude: %v", err)
+			}
+			if w := mc.Warnings(); w != 0 {
+				dbt.Fatalf("warnings after a failed query: %d, want 0 (the prelude's)", w)
+			}
+			return nil
+		}); err != nil {
+			dbt.Fatalf("raw: %s", err)
+		}
+
 		// An empty prelude is QueryResultContext.
 		resp, err = unifiedExecOn(ctx, dbt, conn, []string{}, "SELECT COUNT(*) FROM "+tbl, nil)
 		if err != nil || string(resp.rows[0][0]) != "1" {
@@ -320,4 +389,36 @@ func TestQueryResultAfterContextNeedsMultiStatements(t *testing.T) {
 			dbt.Fatalf("after ErrSkip: %v %v", resp, err)
 		}
 	})
+}
+
+func TestPreludeStatement(t *testing.T) {
+	for _, tt := range []struct {
+		statement                string
+		accepted, changesParsing bool
+	}{
+		{"BEGIN", true, false},
+		{"  begin work", true, false},
+		{"/* why */ BEGIN", true, false},
+		{"-- why\nBEGIN", true, false},
+		{"# why\nSTART TRANSACTION READ ONLY", true, false},
+		{"START REPLICA", false, false},
+		{"SAVEPOINT s1", true, false},
+		{"RELEASE SAVEPOINT s1", true, false},
+		{"ROLLBACK TO SAVEPOINT s1", true, false},
+		{"COMMIT", true, false},
+		{"SELECT 1", true, false},
+		{"SET @@session.sql_mode = ''", true, true},
+		{"set names utf8mb4", true, true},
+		{"CALL p()", false, false},
+		{"INSERT INTO t VALUES (1)", false, false},
+		{"/*!40101 SET @x = 1 */", false, false},
+		{"--BEGIN", false, false},
+		{"/* unterminated BEGIN", false, false},
+		{"", false, false},
+	} {
+		accepted, changesParsing := preludeStatement(tt.statement)
+		if accepted != tt.accepted || changesParsing != tt.changesParsing {
+			t.Errorf("preludeStatement(%q) = %v, %v; want %v, %v", tt.statement, accepted, changesParsing, tt.accepted, tt.changesParsing)
+		}
+	}
 }
