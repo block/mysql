@@ -11,6 +11,7 @@ package mysql
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"io"
@@ -37,14 +38,26 @@ func unifiedExec(ctx context.Context, dbt *DBTest, query string, args []driver.N
 		dbt.Fatalf("getting conn: %s", err)
 	}
 	defer conn.Close()
+	return unifiedExecOn(ctx, dbt, conn, nil, query, args)
+}
 
+// unifiedExecOn is unifiedExec on conn, with prelude run first through
+// QueryResultAfterContext when it is non-nil.
+func unifiedExecOn(ctx context.Context, dbt *DBTest, conn *sql.Conn, prelude []string, query string, args []driver.NamedValue) (*unifiedResponse, error) {
 	resp := &unifiedResponse{}
 	rawErr := conn.Raw(func(dc any) error {
 		mc, ok := dc.(*mysqlConn)
 		if !ok {
 			dbt.Fatalf("driver conn is %T, not *mysqlConn", dc)
 		}
-		rows, result, err := mc.QueryResultContext(ctx, query, args)
+		var rows driver.Rows
+		var result driver.Result
+		var err error
+		if prelude == nil {
+			rows, result, err = mc.QueryResultContext(ctx, query, args)
+		} else {
+			rows, result, err = mc.QueryResultAfterContext(ctx, prelude, query, args)
+		}
 		if err != nil {
 			return err
 		}
@@ -191,6 +204,120 @@ func TestQueryResultContext(t *testing.T) {
 		}
 		if resp, err = unifiedExec(ctx, dbt, "SELECT COUNT(*) FROM "+tbl, nil); err != nil || string(resp.rows[0][0]) != "2" {
 			dbt.Fatalf("conn not reusable after errors: %v %v", resp, err)
+		}
+	})
+}
+
+func TestQueryResultAfterContext(t *testing.T) {
+	// Run with and without InterpolateParams, so the args case is exercised
+	// both ways.
+	for name, params := range map[string]string{"multiStatements": "&multiStatements=true", "multiStatementsInterpolateParams": "&multiStatements=true&interpolateParams=true"} {
+		t.Run(name, func(t *testing.T) { testQueryResultAfterContext(t, dsn+params) })
+	}
+}
+
+func testQueryResultAfterContext(t *testing.T, dsn string) {
+	runTestsParallel(t, dsn, func(dbt *DBTest, tbl string) {
+		ctx := context.Background()
+		dbt.mustExec("CREATE TABLE " + tbl + " (id INT PRIMARY KEY AUTO_INCREMENT, note VARCHAR(16))")
+		conn, err := dbt.db.Conn(ctx)
+		if err != nil {
+			dbt.Fatalf("getting conn: %s", err)
+		}
+		defer conn.Close()
+		count := func() string {
+			resp, err := unifiedExecOn(ctx, dbt, conn, nil, "SELECT COUNT(*) FROM "+tbl, nil)
+			if err != nil {
+				dbt.Fatalf("count: %s", err)
+			}
+			return string(resp.rows[0][0])
+		}
+
+		// The query runs inside the transaction the prelude began, and the
+		// counters are the query's, not BEGIN's.
+		resp, err := unifiedExecOn(ctx, dbt, conn, []string{"BEGIN"}, "INSERT INTO "+tbl+" (note) VALUES ('a')", nil)
+		if err != nil {
+			dbt.Fatalf("BEGIN + INSERT: %s", err)
+		}
+		if resp.isResultset || resp.rowsAffected != 1 || resp.lastInsertID != 1 {
+			dbt.Fatalf("BEGIN + INSERT response: resultset=%v affected=%d insertID=%d", resp.isResultset, resp.rowsAffected, resp.lastInsertID)
+		}
+		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			dbt.Fatalf("rollback: %s", err)
+		}
+		if got := count(); got != "0" {
+			dbt.Fatalf("rows after ROLLBACK: %s, want 0 (the INSERT ran outside the transaction)", got)
+		}
+
+		// A prelude statement's resultset is discarded; the query's is
+		// returned. Args are interpolated into the query only, so a '?' in
+		// the prelude is left alone.
+		if _, err := conn.ExecContext(ctx, "INSERT INTO "+tbl+" (note) VALUES ('b')"); err != nil {
+			dbt.Fatalf("insert: %s", err)
+		}
+		args := []driver.NamedValue{{Ordinal: 1, Value: "b"}}
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{"SELECT 1", "SET @prelude = '?'"}, "SELECT note, @prelude FROM "+tbl+" WHERE note = ?", args)
+		if err != nil {
+			if !errors.Is(err, driver.ErrSkip) {
+				dbt.Fatalf("prelude resultset + args: %s", err)
+			}
+		} else if !resp.isResultset || len(resp.rows) != 1 || string(resp.rows[0][0]) != "b" || string(resp.rows[0][1]) != "?" {
+			dbt.Fatalf("prelude resultset + args rows: %q", resp.rows)
+		}
+
+		// A failed prelude statement stops the command: the query does not
+		// run, the error says so, and the connection stays usable.
+		_, err = unifiedExecOn(ctx, dbt, conn, []string{"SELECT 1", "SELECT * FROM does_not_exist_" + tbl}, "INSERT INTO "+tbl+" (note) VALUES ('c')", nil)
+		var preludeErr *PreludeError
+		var myErr *MySQLError
+		if !errors.As(err, &preludeErr) || preludeErr.Index != 1 || !errors.As(err, &myErr) || myErr.Number != 1146 {
+			dbt.Fatalf("failed prelude error: %v", err)
+		}
+		if got := count(); got != "1" {
+			dbt.Fatalf("rows after a failed prelude: %s, want 1 (the query ran)", got)
+		}
+
+		// A failure of the query itself is the query's error, not a
+		// PreludeError, and the transaction the prelude began stays open.
+		_, err = unifiedExecOn(ctx, dbt, conn, []string{"BEGIN"}, "SELECT * FROM does_not_exist_"+tbl, nil)
+		if errors.As(err, &preludeErr) || !errors.As(err, &myErr) || myErr.Number != 1146 {
+			dbt.Fatalf("query error: %v", err)
+		}
+		if _, err := conn.ExecContext(ctx, "INSERT INTO "+tbl+" (note) VALUES ('d')"); err != nil {
+			dbt.Fatalf("insert: %s", err)
+		}
+		if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+			dbt.Fatalf("rollback: %s", err)
+		}
+		if got := count(); got != "1" {
+			dbt.Fatalf("rows after ROLLBACK: %s, want 1 (the failed query ended the transaction)", got)
+		}
+
+		// An empty prelude is QueryResultContext.
+		resp, err = unifiedExecOn(ctx, dbt, conn, []string{}, "SELECT COUNT(*) FROM "+tbl, nil)
+		if err != nil || string(resp.rows[0][0]) != "1" {
+			dbt.Fatalf("empty prelude: %v %v", resp, err)
+		}
+	})
+}
+
+func TestQueryResultAfterContextNeedsMultiStatements(t *testing.T) {
+	runTestsParallel(t, dsn, func(dbt *DBTest, tbl string) {
+		ctx := context.Background()
+		dbt.mustExec("CREATE TABLE " + tbl + " (id INT PRIMARY KEY AUTO_INCREMENT)")
+		conn, err := dbt.db.Conn(ctx)
+		if err != nil {
+			dbt.Fatalf("getting conn: %s", err)
+		}
+		defer conn.Close()
+
+		// Without MultiStatements nothing is written: the caller falls back.
+		if _, err := unifiedExecOn(ctx, dbt, conn, []string{"BEGIN"}, "INSERT INTO "+tbl+" () VALUES ()", nil); !errors.Is(err, driver.ErrSkip) {
+			dbt.Fatalf("without MultiStatements: %v, want driver.ErrSkip", err)
+		}
+		resp, err := unifiedExecOn(ctx, dbt, conn, nil, "SELECT COUNT(*) FROM "+tbl, nil)
+		if err != nil || string(resp.rows[0][0]) != "0" {
+			dbt.Fatalf("after ErrSkip: %v %v", resp, err)
 		}
 	})
 }

@@ -11,6 +11,9 @@ package mysql
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
+	"fmt"
+	"strings"
 )
 
 // QueryResultContext executes query and returns the server's response in the
@@ -51,6 +54,59 @@ import (
 // not apply), so values forward verbatim — zero dates, float representations,
 // and fractional-second padding survive untouched.
 func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
+	return mc.queryResultContext(ctx, nil, query, args)
+}
+
+// QueryResultAfterContext is QueryResultContext with prelude run first, in
+// the same round trip: the prelude statements and query are sent as one
+// multi-statement COM_QUERY, the prelude's responses are read and discarded,
+// and query's response is returned exactly as QueryResultContext returns it.
+// The result's counters (RowsAffected, LastInsertId, AllRowsAffected) and the
+// warning count describe query alone.
+//
+// A caller that must run a statement before another on the same connection —
+// BEGIN before a transaction's first statement, or session settings before a
+// statement that depends on them — would otherwise wait out one round trip
+// per statement. That costs little against a local server and a full network
+// round trip each against a remote one.
+//
+// The server runs no statement after one that fails, so when a prelude
+// statement fails query is not executed, and the error is a *PreludeError
+// wrapping the server's. An error that is not a *PreludeError (other than a
+// read or write failure) is query's own.
+//
+// Each prelude entry must be exactly one statement, without a trailing
+// semicolon, and takes no args: args apply to query alone. With an empty
+// prelude this is QueryResultContext. Sending several statements in one
+// command needs the MultiStatements option: without it, a non-empty prelude
+// returns driver.ErrSkip before anything is written, so the caller can fall
+// back to running the statements one at a time.
+func (mc *mysqlConn) QueryResultAfterContext(ctx context.Context, prelude []string, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
+	return mc.queryResultContext(ctx, prelude, query, args)
+}
+
+// PreludeError reports that a prelude statement of QueryResultAfterContext
+// failed. The server stops at the first statement that fails, so neither the
+// rest of the prelude nor the query was executed.
+type PreludeError struct {
+	// Index is the failed statement's position in the prelude.
+	Index int
+	// Err is the failure: a *MySQLError for a statement the server rejected.
+	Err error
+}
+
+func (e *PreludeError) Error() string {
+	return fmt.Sprintf("prelude statement %d failed, so the query was not executed: %v", e.Index, e.Err)
+}
+
+func (e *PreludeError) Unwrap() error { return e.Err }
+
+// errPreludeIncomplete reports a multi-statement response that ended before
+// every prelude statement had answered: the server executed fewer statements
+// than were sent, so a prelude entry was not exactly one statement.
+var errPreludeIncomplete = errors.New("the server's response ended before every prelude statement answered; each prelude entry must be exactly one statement")
+
+func (mc *mysqlConn) queryResultContext(ctx context.Context, prelude []string, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
 	if mc.closed.Load() {
 		return nil, nil, driver.ErrBadConn
 	}
@@ -76,7 +132,7 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 		return nil, nil, err
 	}
 
-	rows, result, err := mc.queryResult(query, dargs)
+	rows, result, err := mc.queryResult(prelude, query, dargs)
 	if err != nil || rows == nil {
 		// Error, or a complete OK response: the connection is idle again.
 		mc.finish()
@@ -88,13 +144,18 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 	return rows, nil, nil
 }
 
-// queryResult is the transport half of QueryResultContext. It mirrors
-// mysqlConn.query, except that an OK response is surfaced as a driver.Result
-// (the way Exec reports it) instead of being hidden inside an empty, done
-// resultset.
-func (mc *mysqlConn) queryResult(query string, args []driver.Value) (*textRows, driver.Result, error) {
+// queryResult is the transport half of QueryResultContext and
+// QueryResultAfterContext. It mirrors mysqlConn.query, except that an OK
+// response is surfaced as a driver.Result (the way Exec reports it) instead
+// of being hidden inside an empty, done resultset, and that prelude
+// statements, when there are any, are sent ahead of query in the same
+// command and their responses discarded.
+func (mc *mysqlConn) queryResult(prelude []string, query string, args []driver.Value) (*textRows, driver.Result, error) {
 	handleOk := mc.clearResult()
 
+	if len(prelude) != 0 && !mc.cfg.MultiStatements {
+		return nil, nil, driver.ErrSkip
+	}
 	if len(args) != 0 {
 		if !mc.cfg.InterpolateParams {
 			return nil, nil, driver.ErrSkip
@@ -106,11 +167,39 @@ func (mc *mysqlConn) queryResult(query string, args []driver.Value) (*textRows, 
 		}
 		query = prepared
 	}
+	if len(prelude) != 0 {
+		// Interpolated first, so a '?' in a prelude statement is never
+		// taken for a placeholder.
+		query = strings.Join(prelude, ";") + ";" + query
+	}
 
 	// Send command
 	if err := mc.writeCommandPacketStr(comQuery, query); err != nil {
 		return nil, nil, mc.markBadConn(err)
 	}
+
+	// Each prelude statement answers in turn, and the server marks every
+	// answer but the last with statusMoreResultsExists. An error ends the
+	// response: nothing after the failed statement runs.
+	for i := range prelude {
+		resLen, _, err := handleOk.readResultSetHeaderPacket()
+		if err != nil {
+			return nil, nil, &PreludeError{Index: i, Err: err}
+		}
+		if resLen > 0 {
+			if err := mc.skipColumns(resLen); err != nil {
+				return nil, nil, err
+			}
+			if err := mc.skipRows(); err != nil {
+				return nil, nil, err
+			}
+		}
+		if mc.status&statusMoreResultsExists == 0 {
+			return nil, nil, errPreludeIncomplete
+		}
+	}
+	// Query's counters alone, not the prelude's.
+	handleOk = mc.clearResult()
 
 	// Read Result
 	resLen, _, err := handleOk.readResultSetHeaderPacket()
