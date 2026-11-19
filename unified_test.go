@@ -400,6 +400,8 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "-- why\nBEGIN", accepted: true},
 		{statement: "# why\nSTART TRANSACTION READ ONLY", accepted: true},
 		{statement: "BEGIN -- trailing", accepted: true},
+		{statement: "BEGIN --\x01 trailing", accepted: true},
+		{statement: "SET @x = 1 --\x7f why\n, @y = 2", accepted: true},
 		{statement: "SAVEPOINT s1", accepted: true},
 		{statement: "RELEASE SAVEPOINT s1", accepted: true},
 		{statement: "ROLLBACK TO SAVEPOINT s1", accepted: true},
@@ -424,7 +426,15 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "BEGIN;"},
 		{statement: "/*!40101 SET @x = 1 */"},
 		{statement: "SET @x = 1 /*!; DELETE FROM t */"},
+		{statement: "/*M!100100 SET @x = 1 */"},
+		{statement: "SET @x = 1 /*M! , sql_mode='NO_BACKSLASH_ESCAPES' */"},
 		{statement: "--BEGIN"},
+		// The server reads -- plus a control byte as a comment, so the
+		// quote after it is not one, and the next line sets the mode.
+		{statement: "SET @x = 1 --\x01 '\n, sql_mode = 'NO_BACKSLASH_ESCAPES', @y = 1 --\x01 '"},
+		{statement: "SET @x = 1 --\x7f '\n, sql_mode = 'NO_BACKSLASH_ESCAPES', @y = 1 --\x7f '"},
+		// Whether a non-ASCII byte after -- is a separator depends on the character set.
+		{statement: "SET @x = 1 --\xa0 '\n, sql_mode = 'NO_BACKSLASH_ESCAPES', @y = 1 --\xa0 '"},
 		{statement: ""},
 		{statement: "/* unterminated BEGIN"},
 		{statement: "SELECT 'unterminated"},

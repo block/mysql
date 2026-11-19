@@ -43,7 +43,8 @@ func (p *Prelude) Len() int {
 // each entry must be exactly one statement, without a trailing semicolon,
 // that always answers with exactly one result: BEGIN, START TRANSACTION,
 // COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, SET or SELECT. Comments are
-// allowed; executable comments (/*! ... */) are code and are refused.
+// allowed; executable comments (/*! ... */ and MariaDB's /*M! ... */) are code
+// and are refused.
 //
 // QueryResultContext interpolates the query's args before the server runs the
 // prelude, escaping them for backslash escapes (it declines a prelude with
@@ -243,7 +244,8 @@ func (t preludeToken) is(word string) bool {
 // skipping whitespace and comments. With no backslash, every quoted string
 // ends at the same place whatever sql_mode is, so the scan does too. It
 // refuses a semicolon outside quotes (a second statement), an executable
-// comment, and anything unterminated.
+// comment (/*! or MariaDB's /*M!), -- followed by a non-ASCII byte, and
+// anything unterminated.
 func scanPreludeStatement(s string) ([]preludeToken, error) {
 	var tokens []preludeToken
 	for i := 0; i < len(s); {
@@ -251,14 +253,19 @@ func scanPreludeStatement(s string) ([]preludeToken, error) {
 		switch {
 		case isPreludeSpace(c):
 			i++
-		case c == '#' || c == '-' && strings.HasPrefix(s[i:], "--") && (i+2 == len(s) || isPreludeSpace(s[i+2])):
+		case c == '-' && strings.HasPrefix(s[i:], "--") && i+2 < len(s) && s[i+2] >= 0x80:
+			// Whether a non-ASCII byte after -- starts a comment depends on
+			// the connection's character set, and a Prelude is reused across
+			// connections.
+			return nil, errors.New("contains -- followed by a byte whose meaning depends on the character set")
+		case c == '#' || c == '-' && strings.HasPrefix(s[i:], "--") && (i+2 == len(s) || isPreludeCommentSeparator(s[i+2])):
 			end := strings.IndexByte(s[i:], '\n')
 			if end < 0 {
 				i = len(s)
 			} else {
 				i += end + 1
 			}
-		case strings.HasPrefix(s[i:], "/*!"):
+		case strings.HasPrefix(s[i:], "/*!") || strings.HasPrefix(s[i:], "/*M!"):
 			return nil, errors.New("contains an executable comment")
 		case strings.HasPrefix(s[i:], "/*"):
 			end := strings.Index(s[i+2:], "*/")
@@ -322,6 +329,12 @@ func scanPreludeStatement(s string) ([]preludeToken, error) {
 		}
 	}
 	return tokens, nil
+}
+
+// isPreludeCommentSeparator reports whether c, directly after --, makes the
+// server read a comment: a space or any ASCII control character.
+func isPreludeCommentSeparator(c byte) bool {
+	return c <= ' ' || c == 0x7f
 }
 
 func isPreludeSpace(c byte) bool {
