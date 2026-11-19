@@ -13,12 +13,12 @@ import (
 	"database/sql/driver"
 )
 
-// QueryResultContext executes query and returns the server's response in the
-// form the MySQL protocol describes it: exactly one of rows or result is
-// non-nil on success. A statement that produces a resultset (even an empty
-// one) yields rows; a statement answered with an OK packet (INSERT, UPDATE,
-// DDL, SET, ...) yields result, carrying the affected-row count and last
-// insert id.
+// QueryResultContext executes query, after the statements in prelude, and
+// returns query's response in the form the MySQL protocol describes it:
+// exactly one of rows or result is non-nil on success. A statement that
+// produces a resultset (even an empty one) yields rows; a statement answered
+// with an OK packet (INSERT, UPDATE, DDL, SET, ...) yields result, carrying
+// the affected-row count and last insert id. prelude may be nil.
 //
 // database/sql callers must choose between QueryContext and ExecContext
 // before executing. A caller that receives arbitrary SQL (a proxy, a REPL)
@@ -30,9 +30,9 @@ import (
 //
 //	err := conn.Raw(func(dc any) error {
 //		uq := dc.(interface {
-//			QueryResultContext(context.Context, string, []driver.NamedValue) (driver.Rows, driver.Result, error)
+//			QueryResultContext(context.Context, *mysql.Prelude, string, []driver.NamedValue) (driver.Rows, driver.Result, error)
 //		})
-//		rows, result, err := uq.QueryResultContext(ctx, query, args)
+//		rows, result, err := uq.QueryResultContext(ctx, nil, query, args)
 //		...
 //	})
 //
@@ -50,7 +50,52 @@ import (
 // next Next or Close call. Nothing is parsed into Go types (parseTime does
 // not apply), so values forward verbatim — zero dates, float representations,
 // and fractional-second padding survive untouched.
-func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
+//
+// # Prelude
+//
+// A non-empty prelude, built with NewPrelude, is sent ahead of query in the
+// same round trip, as one multi-statement COM_QUERY. The prelude's responses
+// are read and discarded, and query's response is returned as described
+// above. The result's counters (RowsAffected, LastInsertId, AllRowsAffected)
+// and the warning count describe query alone.
+//
+// A caller that must run a statement before another on the same connection —
+// BEGIN before a transaction's first statement, or session settings before a
+// statement that depends on them — would otherwise wait out one round trip
+// per statement. That costs little against a local server and a full network
+// round trip each against a remote one.
+//
+// The server runs no statement after one that fails, so when the server
+// rejects a prelude statement query is not executed, and the error is a
+// *PreludeError wrapping the server's *MySQLError. Any other error is query's
+// own, or a read or write failure after which what the server executed is
+// unknown: it may have run every statement, query included.
+//
+// Args apply to query alone, and are escaped for backslash escapes, which
+// NewPrelude has made sure the prelude leaves on. On a connection in
+// NO_BACKSLASH_ESCAPES mode a prelude with args is declined with
+// driver.ErrSkip, since a prelude that sets sql_mode would turn the mode off
+// before query is read.
+//
+// A server rejection of any statement in the command as read-only (errors
+// 1290, 1792 and 1836) returns driver.ErrBadConn and closes the connection,
+// as it does without a prelude, rather than a *PreludeError. That includes a
+// rejection of query after earlier prelude statements, such as BEGIN, ran;
+// their effects are confined to the closed connection.
+//
+// Sending several statements in one command needs the MultiStatements
+// option; without it a non-empty prelude returns driver.ErrSkip. A prelude
+// is also declined with driver.ErrSkip when query is empty or only
+// whitespace, and when the prelude and query together exceed the maximum
+// packet size although query alone fits (a query too large on its own
+// returns ErrPktTooLarge as it does without a prelude). Every declined call
+// returns before anything is written, so the caller can fall back to running
+// the statements one at a time.
+//
+// A query that is only a comment is not detected: the server answers the
+// command without a result for it, and the call returns an error after the
+// prelude has run.
+func (mc *mysqlConn) QueryResultContext(ctx context.Context, prelude *Prelude, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
 	if mc.closed.Load() {
 		return nil, nil, driver.ErrBadConn
 	}
@@ -76,7 +121,7 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 		return nil, nil, err
 	}
 
-	rows, result, err := mc.queryResult(query, dargs)
+	rows, result, err := mc.queryResult(prelude, query, dargs)
 	if err != nil || rows == nil {
 		// Error, or a complete OK response: the connection is idle again.
 		mc.finish()
@@ -88,15 +133,42 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, query string, args 
 	return rows, nil, nil
 }
 
+// isBlankQuery reports whether query is empty or only whitespace.
+func isBlankQuery(query string) bool {
+	for i := 0; i < len(query); i++ {
+		if !isPreludeSpace(query[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // queryResult is the transport half of QueryResultContext. It mirrors
 // mysqlConn.query, except that an OK response is surfaced as a driver.Result
 // (the way Exec reports it) instead of being hidden inside an empty, done
-// resultset.
-func (mc *mysqlConn) queryResult(query string, args []driver.Value) (*textRows, driver.Result, error) {
+// resultset, and that prelude statements, when there are any, are sent ahead
+// of query in the same command and their responses discarded.
+func (mc *mysqlConn) queryResult(prelude *Prelude, query string, args []driver.Value) (*textRows, driver.Result, error) {
 	handleOk := mc.clearResult()
 
+	count := prelude.Len()
+	if count != 0 && !mc.cfg.MultiStatements {
+		return nil, nil, driver.ErrSkip
+	}
+	if count != 0 && isBlankQuery(query) {
+		// Nothing would follow the prelude's last ";", and the server
+		// answers the command without a result for the query.
+		return nil, nil, driver.ErrSkip
+	}
 	if len(args) != 0 {
 		if !mc.cfg.InterpolateParams {
+			return nil, nil, driver.ErrSkip
+		}
+		// The args are escaped for the mode the connection is in now, and
+		// the prelude must leave it: NewPrelude refuses
+		// NO_BACKSLASH_ESCAPES, so only a connection already in that mode
+		// could see it change, and there a prelude is declined.
+		if count != 0 && mc.status&statusNoBackslashEscapes != 0 {
 			return nil, nil, driver.ErrSkip
 		}
 		// try client-side prepare to reduce roundtrip
@@ -106,10 +178,53 @@ func (mc *mysqlConn) queryResult(query string, args []driver.Value) (*textRows, 
 		}
 		query = prepared
 	}
+	if count != 0 {
+		// Interpolated first, so a '?' in a prelude statement is never
+		// taken for a placeholder.
+		//
+		// The command is the command byte, the prelude and the query. When
+		// the query fits alone but not behind the prelude, decline rather
+		// than fail, so the caller can send the statements one at a time. A
+		// query too large on its own fails as it would without a prelude.
+		if 1+len(query) <= mc.maxAllowedPacket && 1+len(prelude.text)+len(query) > mc.maxAllowedPacket {
+			return nil, nil, driver.ErrSkip
+		}
+		query = prelude.text + query
+	}
 
 	// Send command
 	if err := mc.writeCommandPacketStr(comQuery, query); err != nil {
 		return nil, nil, mc.markBadConn(err)
+	}
+
+	// Each prelude statement answers in turn, and the server marks every
+	// answer but the last with statusMoreResultsExists. An error ends the
+	// response: nothing after the failed statement runs.
+	for i := range count {
+		resLen, _, err := handleOk.readResultSetHeaderPacket()
+		if err != nil {
+			return nil, nil, mc.preludeFailure(i, err)
+		}
+		if resLen > 0 {
+			if err := mc.skipColumns(resLen); err != nil {
+				return nil, nil, mc.preludeFailure(i, err)
+			}
+			// A statement can fail after its resultset has begun; the
+			// server's error ends the response there too.
+			if err := mc.skipRows(); err != nil {
+				return nil, nil, mc.preludeFailure(i, err)
+			}
+		}
+		if mc.status&statusMoreResultsExists == 0 {
+			return nil, nil, errPreludeIncomplete
+		}
+	}
+	// Query's counters and warning count alone, not the prelude's: the
+	// warning count is otherwise kept until a packet replaces it, and an
+	// error packet from query would not.
+	handleOk = mc.clearResult()
+	if count != 0 {
+		mc.warnings = 0
 	}
 
 	// Read Result

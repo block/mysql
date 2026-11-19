@@ -133,7 +133,7 @@ func execWarnings(
 	if err := conn.Raw(func(dc any) error {
 		mc := dc.(*mysqlConn)
 		for _, query := range queries {
-			rows, _, err := mc.QueryResultContext(ctx, query, nil)
+			rows, _, err := mc.QueryResultContext(ctx, nil, query, nil)
 			if err != nil {
 				queryErr = err
 				break
