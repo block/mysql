@@ -61,6 +61,14 @@ func (p *Prelude) Len() int {
 //   - A SET may not change the character set the server reads the query in:
 //     SET NAMES, SET CHARACTER SET and character_set_client are refused.
 //   - A SET may not assign a GLOBAL or PERSIST variable.
+//   - A statement may not contain a byte at or above 0x80 anywhere but inside
+//     a single- or double-quoted string literal, comments and backtick-quoted
+//     identifiers included. In gbk, big5, sjis, cp932 and gb18030 such a byte
+//     can start a two-byte character whose second byte is a backtick, so
+//     where a quoted identifier starts or ends would depend on the
+//     connection's character set. Quote characters are below 0x40, so they
+//     are never the second byte of a character, and a string literal ends at
+//     the same place in every character set.
 func NewPrelude(statements ...string) (*Prelude, error) {
 	p := &Prelude{count: len(statements)}
 	var text strings.Builder
@@ -244,8 +252,8 @@ func (t preludeToken) is(word string) bool {
 // skipping whitespace and comments. With no backslash, every quoted string
 // ends at the same place whatever sql_mode is, so the scan does too. It
 // refuses a semicolon outside quotes (a second statement), an executable
-// comment (/*! or MariaDB's /*M!), -- followed by a non-ASCII byte, and
-// anything unterminated.
+// comment (/*! or MariaDB's /*M!), a byte at or above 0x80 outside a
+// single- or double-quoted string, and anything unterminated.
 func scanPreludeStatement(s string) ([]preludeToken, error) {
 	var tokens []preludeToken
 	for i := 0; i < len(s); {
@@ -253,24 +261,32 @@ func scanPreludeStatement(s string) ([]preludeToken, error) {
 		switch {
 		case isPreludeSpace(c):
 			i++
-		case c == '-' && strings.HasPrefix(s[i:], "--") && i+2 < len(s) && s[i+2] >= 0x80:
-			// Whether a non-ASCII byte after -- starts a comment depends on
-			// the connection's character set, and a Prelude is reused across
-			// connections.
-			return nil, errors.New("contains -- followed by a byte whose meaning depends on the character set")
+		case c >= 0x80:
+			// In some character sets a byte at or above 0x80 combines with
+			// the next byte into one character, so what that next byte
+			// means (a backtick, or the separator after --) depends on the
+			// connection's character set, and a Prelude is reused across
+			// connections. Only a string literal is immune: its quotes are
+			// below 0x40, and so never the second byte of a character.
+			return nil, errBytePastASCII
 		case c == '#' || c == '-' && strings.HasPrefix(s[i:], "--") && (i+2 == len(s) || isPreludeCommentSeparator(s[i+2])):
 			end := strings.IndexByte(s[i:], '\n')
 			if end < 0 {
-				i = len(s)
-			} else {
-				i += end + 1
+				end = len(s) - i
 			}
+			if hasHighByte(s[i : i+end]) {
+				return nil, errBytePastASCII
+			}
+			i += end
 		case strings.HasPrefix(s[i:], "/*!") || strings.HasPrefix(s[i:], "/*M!"):
 			return nil, errors.New("contains an executable comment")
 		case strings.HasPrefix(s[i:], "/*"):
 			end := strings.Index(s[i+2:], "*/")
 			if end < 0 {
 				return nil, errors.New("contains an unterminated comment")
+			}
+			if hasHighByte(s[i : i+2+end+2]) {
+				return nil, errBytePastASCII
 			}
 			i += 2 + end + 2
 		case c == '\'' || c == '"' || c == '`':
@@ -281,6 +297,9 @@ func scanPreludeStatement(s string) ([]preludeToken, error) {
 				end := strings.IndexByte(s[j:], c)
 				if end < 0 {
 					return nil, errors.New("contains an unterminated quote")
+				}
+				if c == '`' && hasHighByte(s[j:j+end]) {
+					return nil, errBytePastASCII
 				}
 				text.WriteString(s[j : j+end])
 				j += end + 1
@@ -331,6 +350,19 @@ func scanPreludeStatement(s string) ([]preludeToken, error) {
 	return tokens, nil
 }
 
+// errBytePastASCII is the refusal of a byte at or above 0x80 outside a
+// single- or double-quoted string literal.
+var errBytePastASCII = errors.New("contains a byte at or above 0x80 outside a string literal, whose meaning depends on the character set")
+
+func hasHighByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
 // isPreludeCommentSeparator reports whether c, directly after --, makes the
 // server read a comment: a space or any ASCII control character.
 func isPreludeCommentSeparator(c byte) bool {
@@ -342,7 +374,7 @@ func isPreludeSpace(c byte) bool {
 }
 
 func isPreludeNameByte(c byte) bool {
-	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$' || c >= 0x80
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '$'
 }
 
 // PreludeError reports that a prelude statement of QueryResultContext
@@ -366,13 +398,15 @@ func (e *PreludeError) Unwrap() error { return e.Err }
 // than were sent.
 var errPreludeIncomplete = errors.New("the server's response ended before every prelude statement answered")
 
-// asPreludeError reports err as prelude statement index's failure when it is
+// preludeFailure reports err as prelude statement index's failure when it is
 // the server rejecting that statement. Any other error — a read failure or a
 // cancellation — says nothing about what the server executed, and is
-// returned as it is.
-func asPreludeError(index int, err error) error {
+// returned as it is. The query did not run, so a rejection also zeroes the
+// warning count, which would otherwise be an earlier prelude statement's.
+func (mc *mysqlConn) preludeFailure(index int, err error) error {
 	var serverErr *MySQLError
 	if errors.As(err, &serverErr) {
+		mc.warnings = 0
 		return &PreludeError{Index: index, Err: err}
 	}
 	return err

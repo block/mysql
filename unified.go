@@ -77,10 +77,24 @@ import (
 // driver.ErrSkip, since a prelude that sets sql_mode would turn the mode off
 // before query is read.
 //
+// A server rejection of any statement in the command as read-only (errors
+// 1290, 1792 and 1836) returns driver.ErrBadConn and closes the connection,
+// as it does without a prelude, rather than a *PreludeError. That includes a
+// rejection of query after earlier prelude statements, such as BEGIN, ran;
+// their effects are confined to the closed connection.
+//
 // Sending several statements in one command needs the MultiStatements
-// option; without it a non-empty prelude returns driver.ErrSkip. Every
-// declined call returns before anything is written, so the caller can fall
-// back to running the statements one at a time.
+// option; without it a non-empty prelude returns driver.ErrSkip. A prelude
+// is also declined with driver.ErrSkip when query is empty or only
+// whitespace, and when the prelude and query together exceed the maximum
+// packet size although query alone fits (a query too large on its own
+// returns ErrPktTooLarge as it does without a prelude). Every declined call
+// returns before anything is written, so the caller can fall back to running
+// the statements one at a time.
+//
+// A query that is only a comment is not detected: the server answers the
+// command without a result for it, and the call returns an error after the
+// prelude has run.
 func (mc *mysqlConn) QueryResultContext(ctx context.Context, prelude *Prelude, query string, args []driver.NamedValue) (driver.Rows, driver.Result, error) {
 	if mc.closed.Load() {
 		return nil, nil, driver.ErrBadConn
@@ -119,6 +133,16 @@ func (mc *mysqlConn) QueryResultContext(ctx context.Context, prelude *Prelude, q
 	return rows, nil, nil
 }
 
+// isBlankQuery reports whether query is empty or only whitespace.
+func isBlankQuery(query string) bool {
+	for i := 0; i < len(query); i++ {
+		if !isPreludeSpace(query[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // queryResult is the transport half of QueryResultContext. It mirrors
 // mysqlConn.query, except that an OK response is surfaced as a driver.Result
 // (the way Exec reports it) instead of being hidden inside an empty, done
@@ -129,6 +153,11 @@ func (mc *mysqlConn) queryResult(prelude *Prelude, query string, args []driver.V
 
 	count := prelude.Len()
 	if count != 0 && !mc.cfg.MultiStatements {
+		return nil, nil, driver.ErrSkip
+	}
+	if count != 0 && isBlankQuery(query) {
+		// Nothing would follow the prelude's last ";", and the server
+		// answers the command without a result for the query.
 		return nil, nil, driver.ErrSkip
 	}
 	if len(args) != 0 {
@@ -152,6 +181,14 @@ func (mc *mysqlConn) queryResult(prelude *Prelude, query string, args []driver.V
 	if count != 0 {
 		// Interpolated first, so a '?' in a prelude statement is never
 		// taken for a placeholder.
+		//
+		// The command is the command byte, the prelude and the query. When
+		// the query fits alone but not behind the prelude, decline rather
+		// than fail, so the caller can send the statements one at a time. A
+		// query too large on its own fails as it would without a prelude.
+		if 1+len(query) <= mc.maxAllowedPacket && 1+len(prelude.text)+len(query) > mc.maxAllowedPacket {
+			return nil, nil, driver.ErrSkip
+		}
 		query = prelude.text + query
 	}
 
@@ -166,16 +203,16 @@ func (mc *mysqlConn) queryResult(prelude *Prelude, query string, args []driver.V
 	for i := range count {
 		resLen, _, err := handleOk.readResultSetHeaderPacket()
 		if err != nil {
-			return nil, nil, asPreludeError(i, err)
+			return nil, nil, mc.preludeFailure(i, err)
 		}
 		if resLen > 0 {
 			if err := mc.skipColumns(resLen); err != nil {
-				return nil, nil, asPreludeError(i, err)
+				return nil, nil, mc.preludeFailure(i, err)
 			}
 			// A statement can fail after its resultset has begun; the
 			// server's error ends the response there too.
 			if err := mc.skipRows(); err != nil {
-				return nil, nil, asPreludeError(i, err)
+				return nil, nil, mc.preludeFailure(i, err)
 			}
 		}
 		if mc.status&statusMoreResultsExists == 0 {

@@ -417,6 +417,15 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "SET SESSION sql_mode = \"ANSI\"", accepted: true},
 		{statement: "set local `SQL_MODE` = TRADITIONAL", accepted: true},
 		{statement: "SET @sql_mode = 'NO_BACKSLASH_ESCAPES'", accepted: true},
+		// A byte at or above 0x80 is fine inside a string literal: its
+		// quotes are below 0x40, so they are never half of a character.
+		{statement: "SELECT 'caf\xc3\xa9', \"\xe2\x82\xac\"", accepted: true},
+		{statement: "SELECT 'a\x81''b\x81', 1", accepted: true},
+		// A doubled quote is one quote character inside the string, so this
+		// is one sql_mode value, not two adjacent literals. The server
+		// rejects it as a mode name; it is not NO_BACKSLASH_ESCAPES.
+		{statement: "SET sql_mode = 'ANSI''ANSI'", accepted: true},
+		{statement: "SELECT 'a'';SELECT 2'", accepted: true},
 
 		// Not one result each.
 		{statement: "CALL p()"},
@@ -435,8 +444,26 @@ func TestNewPrelude(t *testing.T) {
 		{statement: "SET @x = 1 --\x7f '\n, sql_mode = 'NO_BACKSLASH_ESCAPES', @y = 1 --\x7f '"},
 		// Whether a non-ASCII byte after -- is a separator depends on the character set.
 		{statement: "SET @x = 1 --\xa0 '\n, sql_mode = 'NO_BACKSLASH_ESCAPES', @y = 1 --\xa0 '"},
+		// In gbk, big5, sjis, cp932 and gb18030, 0x81 0x60 is one
+		// character, so a server reading in one of them sees no backtick
+		// here, and the first ; ends the statement.
+		{statement: "SELECT 1 AS \x81` ;DROP TABLE t; -- `"},
+		// The same for the backtick that closes an identifier.
+		{statement: "SELECT `\x81``"},
+		{statement: "SELECT `caf\xc3\xa9`"},
+		{statement: "SELECT caf\xc3\xa9"},
+		{statement: "SELECT 1 /* caf\xc3\xa9 */"},
+		{statement: "SELECT 1 -- caf\xc3\xa9"},
+		{statement: "SELECT 1 # caf\xc3\xa9"},
+		{statement: "SELECT @caf\xc3\xa9"},
 		{statement: ""},
 		{statement: "/* unterminated BEGIN"},
+		{statement: "BEGIN /* unterminated"},
+		{statement: "RELEASE s1"},
+		{statement: "RELEASE"},
+		{statement: "SELECT 'a'';SELECT 2"},
+		{statement: "SET @ = 1"},
+		{statement: "SET GLOBAL = 1"},
 		{statement: "SELECT 'unterminated"},
 		// Changes how the query's args are read.
 		{statement: "SET sql_mode = 'NO_BACKSLASH_ESCAPES'"},
@@ -466,5 +493,160 @@ func TestNewPrelude(t *testing.T) {
 	}
 	if n := (*Prelude)(nil).Len(); n != 0 {
 		t.Errorf("nil Prelude Len = %d", n)
+	}
+}
+
+// fakeServer builds a server's response stream with consecutive sequence
+// numbers, for a mockConn to replay.
+type fakeServer struct {
+	seq byte
+	b   []byte
+}
+
+func (s *fakeServer) packet(payload []byte) {
+	n := len(payload)
+	s.b = append(s.b, byte(n), byte(n>>8), byte(n>>16), s.seq)
+	s.b = append(s.b, payload...)
+	s.seq++
+}
+
+func (s *fakeServer) ok(affected, insertID byte, status, warnings uint16) {
+	s.packet([]byte{iOK, affected, insertID, byte(status), byte(status >> 8), byte(warnings), byte(warnings >> 8)})
+}
+
+func (s *fakeServer) err(number uint16, message string) {
+	s.packet(append([]byte{iERR, byte(number), byte(number >> 8), '#', 'H', 'Y', '0', '0', '0'}, message...))
+}
+
+// preludeFakeConn returns a connection with MultiStatements on, that replays
+// the response. The mock fails a read after a few instead of waiting for a
+// server's answer that never comes, so a call that reads more than the
+// response holds returns an error.
+func preludeFakeConn(multiStatements, interpolateParams bool, response []byte) (*mockConn, *mysqlConn) {
+	conn, mc := newRWMockConn(0)
+	mc.cfg.MultiStatements = multiStatements
+	mc.cfg.InterpolateParams = interpolateParams
+	conn.queuedReplies = [][]byte{response}
+	conn.maxReads = 8
+	return conn, mc
+}
+
+func mustNewPrelude(t *testing.T, statements ...string) *Prelude {
+	t.Helper()
+	p, err := NewPrelude(statements...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// The counters, AllRowsAffected included, describe the query alone.
+func TestQueryResultContextPreludeCountersAreQueryOnly(t *testing.T) {
+	const more = uint16(statusMoreResultsExists)
+	s := &fakeServer{seq: 1}
+	s.ok(7, 0, more, 0) // prelude statement
+	s.ok(1, 5, more, 0) // query statement 1
+	s.ok(2, 6, 0, 0)    // query statement 2
+	_, mc := preludeFakeConn(true, false, s.b)
+	_, res, err := mc.QueryResultContext(context.Background(), mustNewPrelude(t, "SELECT 1"), "INSERT a; INSERT b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res.(*mysqlResult).AllRowsAffected(); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("AllRowsAffected = %v, want [1 2]", got)
+	}
+}
+
+// A ? outside quotes in a prelude statement is not a placeholder: the args
+// are interpolated into the query before the prelude is put in front.
+func TestQueryResultContextPreludeUnquotedQuestionMark(t *testing.T) {
+	const more = uint16(statusMoreResultsExists)
+	s := &fakeServer{seq: 1}
+	s.ok(0, 0, more, 0)
+	s.ok(1, 0, 0, 0)
+	conn, mc := preludeFakeConn(true, true, s.b)
+	args := []driver.NamedValue{{Ordinal: 1, Value: "v"}}
+	if _, _, err := mc.QueryResultContext(context.Background(), mustNewPrelude(t, "SELECT ?"), "UPDATE t SET a = ?", args); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(conn.written[5:]); got != "SELECT ?\n;UPDATE t SET a = 'v'" {
+		t.Fatalf("sent %q", got)
+	}
+}
+
+// A response that ends before every prelude statement has answered is an
+// error, not a read of the query's response that is not there.
+func TestQueryResultContextPreludeIncompleteResponse(t *testing.T) {
+	s := &fakeServer{seq: 1}
+	s.ok(0, 0, 0, 0) // no more results
+	_, mc := preludeFakeConn(true, false, s.b)
+	_, _, err := mc.QueryResultContext(context.Background(), mustNewPrelude(t, "BEGIN"), "SELECT 1", nil)
+	if !errors.Is(err, errPreludeIncomplete) {
+		t.Fatalf("err = %v, want errPreludeIncomplete", err)
+	}
+}
+
+// A command that fits alone but not behind the prelude is declined before
+// anything is written. A query too large on its own is an error, as it is
+// without a prelude.
+func TestQueryResultContextPreludeTooLarge(t *testing.T) {
+	prelude := mustNewPrelude(t, "BEGIN") // 7 bytes in the command
+	for _, tt := range []struct {
+		name    string
+		queryAt int // the query's length
+		want    error
+		written bool
+	}{
+		{"fits exactly", 56, nil, true}, // 1 + 7 + 56 = 64
+		{"too large with the prelude", 57, driver.ErrSkip, false},
+		{"fits alone", 63, driver.ErrSkip, false}, // 1 + 63 = 64
+		{"too large alone", 64, ErrPktTooLarge, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &fakeServer{seq: 1}
+			s.ok(0, 0, uint16(statusMoreResultsExists), 0)
+			s.ok(1, 0, 0, 0)
+			conn, mc := preludeFakeConn(true, false, s.b)
+			mc.maxAllowedPacket = 64
+			query := "SELECT " + strings.Repeat("1", tt.queryAt-len("SELECT "))
+			_, _, err := mc.QueryResultContext(context.Background(), prelude, query, nil)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			if written := len(conn.written) != 0; written != tt.written {
+				t.Fatalf("written = %q", conn.written)
+			}
+		})
+	}
+}
+
+// With nothing after the prelude's last separator the server would answer
+// without a result for the query, after the prelude had run.
+func TestQueryResultContextPreludeEmptyQuery(t *testing.T) {
+	for _, query := range []string{"", " \t\r\n\f\v"} {
+		s := &fakeServer{seq: 1}
+		s.ok(0, 0, 0, 0)
+		conn, mc := preludeFakeConn(true, false, s.b)
+		_, _, err := mc.QueryResultContext(context.Background(), mustNewPrelude(t, "BEGIN"), query, nil)
+		if !errors.Is(err, driver.ErrSkip) || len(conn.written) != 0 {
+			t.Fatalf("query %q: err = %v, written = %q; want ErrSkip and nothing written", query, err, conn.written)
+		}
+	}
+}
+
+// The query did not run after a PreludeError, so it has no warnings; the
+// count an earlier prelude statement left must not be reported.
+func TestQueryResultContextPreludeErrorHasNoWarnings(t *testing.T) {
+	s := &fakeServer{seq: 1}
+	s.ok(0, 0, uint16(statusMoreResultsExists), 3) // prelude statement 0, 3 warnings
+	s.err(1146, "no such table")                   // prelude statement 1
+	_, mc := preludeFakeConn(true, false, s.b)
+	_, _, err := mc.QueryResultContext(context.Background(), mustNewPrelude(t, "SELECT 1", "SELECT 2"), "SELECT 3", nil)
+	var preludeErr *PreludeError
+	if !errors.As(err, &preludeErr) || preludeErr.Index != 1 {
+		t.Fatalf("err = %v, want a PreludeError at index 1", err)
+	}
+	if w := mc.Warnings(); w != 0 {
+		t.Fatalf("Warnings = %d, want 0", w)
 	}
 }
